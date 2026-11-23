@@ -6,7 +6,7 @@ import qs.Commons as Commons
 
 // Fenêtre centrée de Ardoise, façon Boxtop en paysage.
 // À gauche : cpu, mémoire, réseau, disque, carte graphique, avec leurs historiques.
-// À droite : tous les processus regroupés (recherche, tri, actions) et « libère-moi ».
+// À droite : tous les processus regroupés (recherche, tri, actions) et l'analyse avec Claude.
 // Toutes les données viennent du panneau (`hub`), qui garde le flux ardoise.
 PanelWindow {
   id: win
@@ -598,7 +598,7 @@ PanelWindow {
       }
     }
 
-    // ── colonne de droite : processus + libère-moi ──
+    // ── colonne de droite : processus + analyse avec Claude ──
     Item {
       id: right
       x: left.x + left.width + Style.space(14)

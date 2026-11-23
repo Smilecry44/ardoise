@@ -9,7 +9,9 @@ Most monitors list processes one by one. Ardoise groups them by what you actuall
 - **Apps**, grouped by application, and **clones** (the same MCP server running once per session).
 - **The gap**: whatever the breakdown cannot explain, shown instead of hidden. The rows always add up to the RAM in use.
 
-It also draws CPU, memory, network, disk and GPU charts (5 min, 1 h, 24 h), lists every process with actions (pause, resume, lower priority, stop, kill), and answers "free 4 GB for me" with the least painful set of things to close.
+It also draws CPU, memory, network, disk and GPU charts (5 min, 1 h, 24 h), and lists every process grouped by app or session, with actions on hover (pause, resume, lower priority, stop, kill).
+
+To free memory, **Analyze with Claude** opens a Claude Code conversation that reads a full report of the machine (groups, idle sessions, orphan scratchpads, a ranked list of what could be closed) and proposes a plan sorted by gain and risk. It changes nothing without your approval.
 
 The interface follows the system language: French or English.
 
@@ -63,7 +65,7 @@ In the bar entry of `~/.config/omarchy/shell.json`:
 
 ```bash
 omarchy-shell io.github.smilecry44.ardoise openWindow
-omarchy-shell io.github.smilecry44.ardoise liberer 4      # what to close to free 4 GB
+omarchy-shell io.github.smilecry44.ardoise analyser        # open the Claude analysis
 omarchy-shell io.github.smilecry44.ardoise chercher firefox
 omarchy-shell io.github.smilecry44.ardoise vue 1h          # 5min | 1h | 24h
 ```

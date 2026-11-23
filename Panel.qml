@@ -7,7 +7,7 @@ import qs.Ui
 
 // Ardoise : qui occupe la machine, en lignes qui font le total.
 // Pastille dans la barre (RAM utilisée), carte façon Boxtop au clic, et une fenêtre
-// centrée (graphiques, tous les processus, actions, « libère-moi ») au clic droit.
+// centrée (graphiques, tous les processus, actions, analyse avec Claude) au clic droit.
 // Ce panneau est aussi le centre de données : il garde `ardoise --flux` lancé,
 // tient les historiques et passe les actions à la commande ardoise.
 Panel {
@@ -235,8 +235,8 @@ Panel {
           t("Des fichiers stockés en RAM : /tmp, /dev/shm, /run.", "Files stored in RAM: /tmp, /dev/shm, /run.")
           + (hasClaude ? t(" Les scratchpads des sessions Claude en font partie (déjà comptés dans leur facture : la colonne /tmp)",
                            " Claude sessions' scratchpads are part of it (already counted in their bill: the /tmp column)") : "")
-          + (orphans > 1048576 ? t(", plus ", ", plus ") + go(orphans) + t(" de scratchpads de sessions fermées, à vider depuis la carte ou « libère-moi »",
-                                                                         " of scratchpads from closed sessions, to clear from the card or “free me”") : "")
+          + (orphans > 1048576 ? t(", plus ", ", plus ") + go(orphans) + t(" de scratchpads de sessions fermées, à vider depuis la carte ou avec l'analyse Claude",
+                                                                         " of scratchpads from closed sessions, to clear from the card or with the Claude analysis") : "")
           + t(". Une partie est compressée dans la zram.", ". Part of it is compressed in zram.")),
       row("noyau", t("noyau", "kernel"), p.kernel,
           t("La mémoire du noyau Linux lui-même : tables de pages, piles, caches internes non récupérables.",
@@ -487,7 +487,6 @@ Panel {
     function openWindow(): void { root.openWindow() }
     function closeWindow(): void { root.closeWindow() }
     function toggleWindow(): void { root.toggleWindow() }
-    function liberer(go: int): void { root.openWindow(); root.liberer(go) }
     function analyser(): void { root.analyser("") }
     function chercher(texte: string): void { root.openWindow(); root.search = texte }
     function vue(plage: string): void { root.range = plage === "5min" ? "live" : plage }
