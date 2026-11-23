@@ -1,0 +1,54 @@
+{
+  "schemaVersion": 1,
+  "id": "io.github.smilecry44.ardoise",
+  "name": "Ardoise",
+  "version": "0.3.0",
+  "author": "Quentin",
+  "license": "MIT",
+  "description": "Who is using your machine, in rows that add up to the total: Claude Code sessions with their MCP servers and scratchpads, memory owned by no process (/tmp, zram, kernel), apps and clones. CPU, network, disk and GPU charts. Follows the system language (English, French).",
+  "kinds": [
+    "bar-widget"
+  ],
+  "entryPoints": {
+    "barWidget": "Panel.qml"
+  },
+  "barWidget": {
+    "displayName": "Ardoise",
+    "description": "CPU, RAM and disk in the bar; click for the full breakdown",
+    "category": "System",
+    "allowMultiple": false,
+    "defaultSection": "right",
+    "defaults": {},
+    "schema": [
+      {
+        "key": "language",
+        "type": "enum",
+        "label": "Language",
+        "options": [
+          "auto",
+          "fr",
+          "en"
+        ],
+        "defaultValue": "auto",
+        "description": "auto follows the system locale (French for fr_*, otherwise English)."
+      },
+      {
+        "key": "herdrSpace",
+        "type": "string",
+        "label": "Herdr space for the analysis",
+        "defaultValue": "Ardoise",
+        "description": "Herdr space where “Analyze with Claude” opens its conversation (created if missing). Ignored without Herdr."
+      },
+      {
+        "key": "alertThreshold",
+        "type": "integer",
+        "label": "RAM alert threshold (%)",
+        "min": 50,
+        "max": 99,
+        "step": 1,
+        "defaultValue": 85,
+        "description": "Notify when used RAM reaches this percentage, naming the biggest consumers."
+      }
+    ]
+  }
+}

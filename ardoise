@@ -1,0 +1,1681 @@
+#!/usr/bin/env python3
+"""ardoise : qui occupe la machine, en lignes qui font le total.
+(ardoise: who is using the machine, in lines that add up to the total.)
+
+La RAM utilisée (MemTotal - MemAvailable) est répartie entre :
+  - les groupes de processus (une session Claude avec ses MCP, une appli, les terminaux Herdr…),
+    comptés en PSS : la mémoire partagée n'est comptée qu'une fois ;
+  - la ligne « Personne » : fichiers en RAM (/tmp, /dev/shm), noyau, réserve, carte graphique ;
+  - la zram (le swap compressé, qui vit lui aussi en RAM), répartie au prorata
+    entre les groupes et /tmp qui y ont des pages ;
+  - « l'écart » : ce que le bilan n'explique pas (cache verrouillé, pilotes…).
+
+Usage : ardoise [--json] [--all]       bilan lisible, ou en JSON
+        ardoise --court                 pourcentage de RAM utilisé (pour la barre)
+        ardoise --flux                  une ligne JSON toutes les 2 s (pour le widget) ;
+                                        lit sur l'entrée « open » / « close » / « tick »
+        ardoise fermer <pid>            arrête une session Claude (elle se reprend avec --resume)
+        ardoise vider <id de session>   supprime le scratchpad d'une session fermée
+        ardoise montrer <pid>           affiche la conversation d'une session dans Herdr
+        ardoise analyser [--raison …]   relevé complet + conversation Claude pour l'analyser
+        ardoise --flux --seuil 85       seuil de l'alerte RAM (en %)
+        ardoise action <verbe> <pid>…   pause | reprendre | priorite | normal | terminer | tuer
+        ardoise liberer <Go>            propose quoi fermer pour libérer autant (JSON)
+        ardoise appliquer <élément>…    session:<pid> vider:<id> app:<pid+pid…>
+        --lang fr|en                    langue (sinon ARDOISE_LANG, le réglage « language »
+                                        du plugin dans shell.json, puis la langue du système)
+"""
+import glob
+import json
+import os
+import re
+import select
+import shutil
+import signal
+import sys
+import time
+
+UID = os.getuid()
+HOME = os.path.expanduser("~")
+
+
+# ---------- langue et réglages ----------
+
+def _plugin_entry():
+    """L'entrée {"id": "io.github.smilecry44.ardoise", …} de la barre dans ~/.config/omarchy/shell.json."""
+    try:
+        data = json.load(open(os.path.join(HOME, ".config", "omarchy", "shell.json")))
+    except (OSError, ValueError):
+        return {}
+    stack = [data]
+    while stack:
+        x = stack.pop()
+        if isinstance(x, dict):
+            if x.get("id") == "io.github.smilecry44.ardoise":
+                return x
+            stack.extend(x.values())
+        elif isinstance(x, list):
+            stack.extend(x)
+    return {}
+
+
+SETTINGS = _plugin_entry()
+
+
+def _norm_lang(v):
+    v = str(v or "").strip().lower()
+    if not v or v == "auto":
+        return None
+    return "fr" if v.startswith("fr") else "en"
+
+
+def _resolve_lang():
+    """--lang (retiré de argv), ARDOISE_LANG, réglage « language » du plugin, langue du système."""
+    a = sys.argv
+    for i, v in enumerate(a):
+        if v == "--lang":
+            val = a[i + 1] if i + 1 < len(a) else ""
+            del a[i:i + 2]
+            if _norm_lang(val):
+                return _norm_lang(val)
+            break
+        if v.startswith("--lang="):
+            del a[i]
+            if _norm_lang(v[7:]):
+                return _norm_lang(v[7:])
+            break
+    for v in (os.environ.get("ARDOISE_LANG"), SETTINGS.get("language")):
+        if _norm_lang(v):
+            return _norm_lang(v)
+    for k in ("LC_ALL", "LC_MESSAGES", "LANG"):
+        v = os.environ.get(k)
+        if v:
+            return "fr" if v.lower().startswith("fr") else "en"
+    return "en"
+
+
+LANG_ = _resolve_lang()
+FR = LANG_ == "fr"
+
+
+def T(fr, en):
+    return fr if FR else en
+
+
+HAS_CLAUDE = shutil.which("claude") is not None
+GO_U, MO_U = T("Go", "GB"), T("Mo", "MB")
+KB = 1024
+GO = 1024 ** 3
+HZ = os.sysconf("SC_CLK_TCK")
+PAGE = os.sysconf("SC_PAGE_SIZE")
+NCPU = os.cpu_count() or 1
+
+# Ce que les actions ne touchent jamais : le bureau lui-même.
+PROTECTED = {
+    "systemd", "Hyprland", "quickshell", "qs", "omarchy-shell", "herdr-app", "herdr",
+    "pipewire", "pipewire-pulse", "wireplumber", "dbus-daemon", "dbus-broker", "dbus-broker-lau",
+    "Xwayland", "hypridle", "hyprlock", "hyprpaper", "swaybg", "sddm", "uwsm", "mako",
+    "gnome-keyring-d", "polkit-gnome-au", "xdg-desktop-por", "xdg-document-po", "xdg-permission-",
+    "ardoise", "sshd", "login", "agetty", "NetworkManager", "iwd", "bluetoothd",
+}
+
+
+# ---------- lecture système ----------
+
+def read(path, binary=False):
+    try:
+        with open(path, "rb" if binary else "r") as f:
+            return f.read()
+    except OSError:
+        return None
+
+
+def meminfo():
+    out = {}
+    for line in (read("/proc/meminfo") or "").splitlines():
+        k, v = line.split(":", 1)
+        out[k] = int(v.split()[0]) * KB
+    return out
+
+
+def zram():
+    """Mémoire réellement occupée par la zram, et données qu'elle contient."""
+    used = orig = 0
+    for dev in glob.glob("/sys/block/zram*/mm_stat"):
+        f = (read(dev) or "").split()
+        if len(f) >= 3:
+            orig += int(f[0])
+            used += int(f[2])  # mem_used_total
+    return used, orig
+
+
+def proc_mem(pid):
+    """(ram, swap, shmem) en octets. PSS pour nos processus, RSS sinon."""
+    r = read(f"/proc/{pid}/smaps_rollup")
+    if r:
+        v = dict(re.findall(r"^(\w+):\s+(\d+) kB", r, re.M))
+        shm = int(v.get("Pss_Shmem", 0))
+        ram = int(v.get("Pss_Anon", 0)) + shm
+        swap = int(v.get("SwapPss", v.get("Swap", 0)))
+        return ram * KB, swap * KB, shm * KB
+    s = read(f"/proc/{pid}/status")
+    if not s:
+        return 0, 0, 0
+    v = dict(re.findall(r"^(\w+):\s+(\d+) kB", s, re.M))
+    return (int(v.get("RssAnon", 0)) + int(v.get("RssShmem", 0))) * KB, int(v.get("VmSwap", 0)) * KB, 0
+
+
+def processes():
+    procs = {}
+    for d in os.listdir("/proc"):
+        if not d.isdigit():
+            continue
+        pid = int(d)
+        stat = read(f"/proc/{pid}/stat")
+        if not stat:
+            continue
+        rp = stat.rfind(")")  # comm peut contenir des espaces et des parenthèses
+        comm = stat[stat.find("(") + 1:rp]
+        f = stat[rp + 2:].split()
+        cmd = read(f"/proc/{pid}/cmdline", binary=True) or b""
+        argv = [a.decode(errors="replace") for a in cmd.split(b"\0") if a]
+        if not argv:  # thread noyau
+            continue
+        ram, swap, shm = proc_mem(pid)
+        try:
+            uid = os.stat(f"/proc/{pid}").st_uid
+        except OSError:
+            continue
+        cg = (read(f"/proc/{pid}/cgroup") or "").strip().split("::")[-1]
+        procs[pid] = dict(pid=pid, ppid=int(f[1]), comm=comm, argv=argv, state=f[0], nice=int(f[16]),
+                          ram=ram, swap=swap, shm=shm, cpu=int(f[11]) + int(f[12]), start=int(f[19]),
+                          uid=uid, cgroup=cg)
+    return procs
+
+
+def claude_sessions():
+    """pid -> fiche de session écrite par Claude Code."""
+    out = {}
+    for f in glob.glob(f"{HOME}/.claude/sessions/*.json"):
+        try:
+            d = json.load(open(f))
+            out[int(d["pid"])] = d
+        except (OSError, ValueError, KeyError):
+            pass
+    return out
+
+
+def du(path):
+    total = 0
+    for root, dirs, files in os.walk(path, onerror=lambda e: None):
+        for n in files:
+            try:
+                total += os.lstat(os.path.join(root, n)).st_blocks * 512
+            except OSError:
+                pass
+    return total
+
+
+def tmpfs_mounts():
+    out = []
+    for line in open("/proc/mounts"):
+        dev, mnt, fs = line.split()[:3]
+        if fs == "tmpfs":
+            try:
+                st = os.statvfs(mnt)
+            except OSError:
+                continue
+            used = (st.f_blocks - st.f_bfree) * st.f_frsize
+            if used > 0:
+                out.append((mnt.replace("\\040", " "), used))
+    return out
+
+
+_pads_cache = {"t": 0, "v": {}}
+
+
+def scratchpads(max_age=0):
+    """Dossiers de travail des sessions Claude dans /tmp : id de session -> (taille, chemin)."""
+    if max_age and time.time() - _pads_cache["t"] < max_age:
+        return _pads_cache["v"]
+    out = {}
+    for d in glob.glob(f"/tmp/claude-{UID}/*/*"):
+        sid = os.path.basename(d)
+        if re.fullmatch(r"[0-9a-f-]{36}", sid):
+            out[sid] = (du(d), d)
+    _pads_cache.update(t=time.time(), v=out)
+    return out
+
+
+def kernel_reserve():
+    """Mémoire que le noyau ne compte jamais comme disponible (réserves des zones + cache gardé)."""
+    total = 0
+    for blk in re.split(r"\nNode ", read("/proc/zoneinfo") or ""):
+        hi = re.search(r"\n\s+high\s+(\d+)", blk)
+        lo = re.search(r"\n\s+low\s+(\d+)", blk)
+        pr = re.search(r"protection: \(([^)]*)\)", blk)
+        mg = re.search(r"managed\s+(\d+)", blk)
+        if hi and lo and pr and mg:
+            total += min(max(int(x) for x in pr.group(1).split(",")) + int(hi.group(1)), int(mg.group(1)))
+            total += int(lo.group(1))  # part du cache que MemAvailable ne compte pas
+    return total * PAGE
+
+
+def first_int(path):
+    try:
+        return int((read(path) or "").split()[0])
+    except (ValueError, IndexError):
+        return None
+
+
+def gpu():
+    """Carte graphique AMD : charge, VRAM, mémoire système prêtée (GTT), température."""
+    out = dict(busy=None, vram_used=0, vram_total=0, gtt=0, temp=None)
+    for card in glob.glob("/sys/class/drm/card*/device"):
+        b = first_int(f"{card}/gpu_busy_percent")
+        if b is None:
+            continue
+        out["busy"] = max(out["busy"] or 0, b)
+        out["vram_used"] += first_int(f"{card}/mem_info_vram_used") or 0
+        out["vram_total"] += first_int(f"{card}/mem_info_vram_total") or 0
+        out["gtt"] += first_int(f"{card}/mem_info_gtt_used") or 0
+    for h in glob.glob("/sys/class/hwmon/hwmon*"):
+        name = (read(f"{h}/name") or "").strip()
+        t = first_int(f"{h}/temp1_input")
+        if name == "amdgpu" and t:
+            out["temp"] = t / 1000
+    return out
+
+
+def cpu_temp():
+    for h in glob.glob("/sys/class/hwmon/hwmon*"):
+        if (read(f"{h}/name") or "").strip() in ("k10temp", "coretemp", "zenpower"):
+            t = first_int(f"{h}/temp1_input")
+            if t:
+                return t / 1000
+    return None
+
+
+def cpu_times():
+    """[(occupé, total)] : la machine puis chaque cœur."""
+    out = []
+    for line in (read("/proc/stat") or "").splitlines():
+        if not line.startswith("cpu"):
+            break
+        v = [int(x) for x in line.split()[1:]]
+        idle = v[3] + (v[4] if len(v) > 4 else 0)
+        out.append((sum(v[:8]) - idle, sum(v[:8])))
+    return out
+
+
+def net_bytes():
+    rx = tx = 0
+    for line in (read("/proc/net/dev") or "").splitlines()[2:]:
+        name, data = line.split(":", 1)
+        if name.strip() == "lo":
+            continue
+        f = data.split()
+        rx += int(f[0])
+        tx += int(f[8])
+    return rx, tx
+
+
+DISK = re.compile(r"^(nvme\d+n\d+|sd[a-z]+|vd[a-z]+|mmcblk\d+)$")
+
+
+def disk_bytes():
+    r = w = 0
+    for line in (read("/proc/diskstats") or "").splitlines():
+        f = line.split()
+        if len(f) > 9 and DISK.match(f[2]):
+            r += int(f[5]) * 512
+            w += int(f[9]) * 512
+    return r, w
+
+
+_disk_map = {"t": 0, "v": []}
+
+
+def disk_usage():
+    """Une ligne par disque physique : son modèle, son point de montage principal et son
+    remplissage. `/` d'abord (c'est le chiffre de la pastille), puis les autres disques."""
+    if time.time() - _disk_map["t"] > 60:  # quel système de fichiers est sur quel disque : relu chaque minute
+        best = {}
+        for line in open("/proc/mounts"):
+            src, mnt, fs = line.split()[:3]
+            if not src.startswith("/dev/") or fs in ("vfat", "squashfs", "iso9660"):
+                continue
+            mnt = mnt.replace("\\040", " ")
+            disk = _disk_of(mnt)
+            if not disk or not os.path.exists(f"/sys/block/{disk}"):
+                continue
+            if disk not in best or len(mnt) < len(best[disk]):
+                best[disk] = mnt
+        _disk_map.update(t=time.time(), v=sorted(best.items(), key=lambda x: (x[1] != "/", x[1])))
+    out = []
+    for disk, mnt in _disk_map["v"]:
+        try:
+            st = os.statvfs(mnt)
+        except OSError:
+            continue
+        model = re.sub(r"\s+", " ", (read(f"/sys/block/{disk}/device/model") or disk).strip())
+        out.append(dict(disk=disk, model=model, path=mnt.replace(HOME, "~"),
+                        used=(st.f_blocks - st.f_bfree) * st.f_frsize, total=st.f_blocks * st.f_frsize))
+    return out
+
+
+# ---------- descriptions ----------
+
+# Ce qu'est un programme, en clair (français, anglais). Clé : nom en minuscules (groupe, programme ou MCP).
+_HELIUM = ("Helium, un navigateur web (base Chromium). Chaque onglet, extension et appli web y est un processus.",
+           "Helium, a web browser (Chromium based). Every tab, extension and web app in it is a process.")
+_HERDR = ("Herdr, un poste de pilotage pour agents et conversations Claude.",
+          "Herdr, a workspace for running agents and Claude conversations.")
+_COMPANION = ("Le lanceur de Companion, la grille d'applis.", "The Companion launcher, the app grid.")
+_NODE_MAIN = ("Un programme Node.js lancé hors d'une session Claude (serveur de dev, outil…). Déplie pour voir sa commande.",
+              "A Node.js program started outside a Claude session (dev server, tool…). Expand to see its command.")
+_PY = ("Des scripts Python. Déplie pour voir lesquels.", "Python scripts. Expand to see which ones.")
+_NOTIF = ("Les notifications.", "Notifications.")
+_BG = ("Le fond d'écran.", "The wallpaper.")
+_KEYRING = ("Le trousseau : garde les mots de passe et les clés.", "The keyring: stores passwords and keys.")
+_DBUS = ("D-Bus : le canal par lequel les applis se parlent.", "D-Bus: the channel apps use to talk to each other.")
+_NORD = ("Le service NordVPN.", "The NordVPN service.")
+_FCITX = ("Fcitx5 : méthodes de saisie (accents, autres alphabets).", "Fcitx5: input methods (accents, other alphabets).")
+_BT = ("Le Bluetooth.", "Bluetooth.")
+_GHOSTTY = ("Le terminal Ghostty.", "The Ghostty terminal.")
+_PORTALS = ("Les portails : partage d'écran, choix de fichiers et autorisations pour les applis.",
+            "Portals: screen sharing, file pickers and permissions for apps.")
+_DESCRIPTIONS = {
+    "helium": _HELIUM,
+    "helium-fr": _HELIUM,
+    "chromium": ("Une appli basée sur Chromium (navigateur ou appli web ouverte en fenêtre).",
+                 "A Chromium-based app (browser or web app opened in a window)."),
+    "quickshell": ("Le shell d'Omarchy : la barre du haut, les menus, les notifications et les plugins (dont Ardoise).",
+                   "The Omarchy shell: the top bar, menus, notifications and plugins (Ardoise included)."),
+    "qs": ("Le shell d'Omarchy : la barre du haut, les menus et les plugins.",
+           "The Omarchy shell: the top bar, menus and plugins."),
+    "steam": ("Steam, la boutique et le lanceur de jeux.", "Steam, the game store and launcher."),
+    "steamwebhelper": ("L'interface de Steam : un navigateur Chromium embarqué. Il reste en mémoire même fenêtre fermée.",
+                       "Steam's interface: an embedded Chromium browser. It stays in memory even with the window closed."),
+    "herdr-app": _HERDR,
+    "herdr": _HERDR,
+    "herdr · terminaux": ("Les terminaux ouverts dans Herdr qui ne sont pas des sessions Claude : shells, serveurs de dev, commandes en cours.",
+                          "Terminals open in Herdr that are not Claude sessions: shells, dev servers, running commands."),
+    "hyprland": ("Hyprland, le gestionnaire de fenêtres : il compose et dessine tout l'écran. Indispensable.",
+                 "Hyprland, the window manager: it composes and draws the whole screen. Essential."),
+    "xwayland": ("Xwayland : fait tourner les applis X11 anciennes sous Wayland.", "Xwayland: runs older X11 apps under Wayland."),
+    "pipewire": ("PipeWire, le son et la vidéo du système (micro, haut-parleurs, partage d'écran).",
+                 "PipeWire, the system's audio and video (mic, speakers, screen sharing)."),
+    "pipewire-pulse": ("La couche de compatibilité PulseAudio de PipeWire : le son des applis.",
+                       "PipeWire's PulseAudio compatibility layer: app audio."),
+    "wireplumber": ("Le chef d'orchestre de PipeWire : choisit les sorties et entrées son.",
+                    "PipeWire's session manager: picks audio outputs and inputs."),
+    "nordvpnd": _NORD,
+    "nordvpn": _NORD,
+    "voxtype": ("Voxtype, la dictée vocale.", "Voxtype, voice dictation."),
+    "voxtype-bandeau": ("Le bandeau de Voxtype qui s'affiche pendant la dictée.", "Voxtype's overlay shown while dictating."),
+    "obs": ("OBS Studio : enregistrement et diffusion de l'écran.", "OBS Studio: screen recording and streaming."),
+    "udiskie": ("Monte automatiquement les clés USB et disques externes.", "Automatically mounts USB sticks and external drives."),
+    "node-mainthread": _NODE_MAIN,
+    "node": ("Un programme Node.js. Déplie pour voir sa commande.", "A Node.js program. Expand to see its command."),
+    "python3": _PY,
+    "python": _PY,
+    "aurore-compagnon": ("Aurore, une assistante vocale.", "Aurore, a voice assistant."),
+    "companion-launcher": _COMPANION,
+    "companion-app-launcher": _COMPANION,
+    "companion-launc": _COMPANION,
+    "zapfast": ("ZapFast, un client de messagerie.", "ZapFast, a messaging client."),
+    "irori.appimage": ("Irori, une appli lancée depuis un fichier AppImage.", "Irori, an app started from an AppImage file."),
+    "systemd": ("systemd : démarre et surveille tous les services. Indispensable.",
+                "systemd: starts and supervises every service. Essential."),
+    "dbus-daemon": _DBUS,
+    "dbus-broker": _DBUS,
+    "networkmanager": ("La gestion du réseau (Wi-Fi, Ethernet).", "Network management (Wi-Fi, Ethernet)."),
+    "iwd": ("Le Wi-Fi.", "Wi-Fi."),
+    "bluetoothd": _BT,
+    "gnome-keyring-daemon": _KEYRING,
+    "gnome-keyring-d": _KEYRING,
+    "xdg-desktop-portal": _PORTALS,
+    "mako": _NOTIF,
+    "swaync": _NOTIF,
+    "hypridle": ("Surveille l'inactivité pour verrouiller ou mettre en veille.", "Watches for inactivity to lock or suspend."),
+    "hyprpaper": _BG,
+    "swaybg": _BG,
+    "walker": ("Le lanceur d'applis.", "The app launcher."),
+    "elephant": ("Le moteur de recherche du lanceur d'applis.", "The app launcher's search engine."),
+    "ghostty": _GHOSTTY,
+    "alacritty": ("Le terminal Alacritty.", "The Alacritty terminal."),
+    "kitty": ("Le terminal Kitty.", "The Kitty terminal."),
+    "ardoise": ("Ardoise lui-même : le relevé qui alimente ce tableau.", "Ardoise itself: the reader that feeds this view."),
+    "claude": ("Le processus principal de Claude Code (la conversation elle-même).",
+               "The main Claude Code process (the conversation itself)."),
+    "shell": ("Un shell lancé par Claude : une commande Bash en cours.", "A shell started by Claude: a running Bash command."),
+    "sketchy": ("Serveur MCP Sketchy : dessine des schémas dans le chat. Un exemplaire par session Claude.",
+                "Sketchy MCP server: draws diagrams in the chat. One copy per Claude session."),
+    "server-pdf": ("Serveur MCP PDF viewer : ouvre et annote des PDF. Un exemplaire par session Claude.",
+                   "PDF viewer MCP server: opens and annotates PDFs. One copy per Claude session."),
+    "mcp-search-console": ("Serveur MCP Google Search Console (SEO). Un exemplaire par session Claude.",
+                           "Google Search Console MCP server (SEO). One copy per Claude session."),
+    "gitkraken": ("GitKraken CLI en serveur MCP : outils git et GitHub. Un exemplaire par session Claude.",
+                  "GitKraken CLI as an MCP server: git and GitHub tools. One copy per Claude session."),
+    "materialcraft": ("Serveur MCP de MaterialCraft (Artcraft).", "MaterialCraft MCP server (Artcraft)."),
+    "texturecraft": ("Serveur MCP de TextureCraft (Artcraft).", "TextureCraft MCP server (Artcraft)."),
+    "photocraft": ("Serveur MCP de PhotoCraft (Artcraft).", "PhotoCraft MCP server (Artcraft)."),
+    "effectcraft": ("Serveur MCP d'EffectCraft (Artcraft).", "EffectCraft MCP server (Artcraft)."),
+    "ollama": ("Ollama : fait tourner des modèles d'IA en local. Peut garder beaucoup de RAM et de VRAM même au repos.",
+               "Ollama: runs AI models locally. Can hold a lot of RAM and VRAM even when idle."),
+    "uwsm": ("Le gestionnaire de session Wayland : lance Hyprland et la session.",
+             "The Wayland session manager: starts Hyprland and the session."),
+    "espanso": ("Espanso : remplace des abréviations par du texte en tapant.", "Espanso: expands abbreviations into text as you type."),
+    "omarchy-fcitx5": _FCITX,
+    "fcitx5": _FCITX,
+    "upower": ("UPower : batterie et énergie des appareils.", "UPower: battery and device power."),
+    "polkit": ("Polkit : décide qui peut faire des actions administrateur.", "Polkit: decides who may perform admin actions."),
+    "inotifywait": ("Un script qui surveille des fichiers pour réagir à leurs changements.",
+                    "A script watching files to react when they change."),
+    "hyprmoncfgd": ("hyprmoncfg : réapplique la disposition des écrans quand on les branche.",
+                    "hyprmoncfg: reapplies the monitor layout when screens are plugged in."),
+    "ghostty-surface-transient": _GHOSTTY,
+    "udisks2": ("UDisks : gère les disques et leur montage (service système).", "UDisks: manages disks and mounting (system service)."),
+    "sddm": ("L'écran de connexion.", "The login screen."),
+    "session-2": ("La session utilisateur (connexion).", "The user session (login)."),
+    "(sd-pam)": ("Le reste de l'ouverture de session (systemd).", "What remains of the session login (systemd)."),
+    "wpa_supplicant": ("Le Wi-Fi (authentification).", "Wi-Fi (authentication)."),
+    "avahi-daemon": ("Avahi : découvre les appareils du réseau local (imprimantes, partages).",
+                     "Avahi: discovers devices on the local network (printers, shares)."),
+    "power-profiles-daemon": ("Les profils d'énergie (économie, équilibré, performance).",
+                              "Power profiles (power saver, balanced, performance)."),
+    "bluetooth": _BT,
+    "limine-snapper-sync": ("Synchronise les instantanés Snapper avec le menu de démarrage Limine.",
+                            "Syncs Snapper snapshots with the Limine boot menu."),
+    "fusermount3": ("Un système de fichiers monté par une appli (FUSE).", "A file system mounted by an app (FUSE)."),
+}
+DESCRIPTIONS = {k: T(*v) for k, v in _DESCRIPTIONS.items()}
+
+PREFIXES = [
+    ("aurore-", T("Un module d'Aurore, une assistante vocale.", "A module of Aurore, a voice assistant.")),
+    ("hc-serve-", T("Un service interne de Herdr.", "An internal Herdr service.")),
+    ("hc-hold-", T("Un terminal tenu ouvert par Herdr.", "A terminal kept open by Herdr.")),
+    ("systemd-", T("Un service de systemd (fonctionnement du système).", "A systemd service (system plumbing).")),
+    ("xdg-", T(*_PORTALS)),
+    ("kworker", T("Un fil de travail du noyau Linux.", "A Linux kernel worker thread.")),
+]
+INTERPRETERS = re.compile(r"^(python[\d.]*|node|bun|deno|bash|sh|zsh|perl|ruby|java|uv|npm|npx)$")
+
+_desc_cache_path = os.path.join(os.environ.get("XDG_CACHE_HOME", f"{HOME}/.cache"), "ardoise", f"descriptions.{LANG_}.json")
+_desc_cache = None
+_desc_budget = [0]
+
+
+def _load_desc_cache():
+    global _desc_cache
+    if _desc_cache is None:
+        try:
+            _desc_cache = json.load(open(_desc_cache_path))
+        except (OSError, ValueError):
+            _desc_cache = {}
+    return _desc_cache
+
+
+def _save_desc_cache():
+    try:
+        os.makedirs(os.path.dirname(_desc_cache_path), exist_ok=True)
+        with open(_desc_cache_path + ".tmp", "w") as f:
+            json.dump(_desc_cache, f, ensure_ascii=False)
+        os.replace(_desc_cache_path + ".tmp", _desc_cache_path)
+    except OSError:
+        pass
+
+
+def _desktop_comment(name):
+    want = name.lower()
+    for d in (f"{HOME}/.local/share/applications", "/usr/share/applications"):
+        for f in glob.glob(f"{d}/*.desktop"):
+            base = os.path.basename(f)[:-8].lower()
+            if want not in (base, base.split(".")[-1]):
+                continue
+            txt = read(f) or ""
+            for key in (("Comment[fr]", "GenericName[fr]") if FR else ()) + ("Comment", "GenericName"):
+                m = re.search(rf"^{re.escape(key)}=(.+)$", txt, re.M)
+                if m:
+                    return m.group(1).strip()
+    return None
+
+
+def _pacman_desc(exe):
+    import subprocess
+    try:
+        pkg = subprocess.run(["pacman", "-Qqo", exe], capture_output=True, text=True, timeout=3).stdout.strip()
+        if not pkg:
+            return None
+        info = subprocess.run(["pacman", "-Qi", pkg], capture_output=True, text=True, timeout=3,
+                              env={**os.environ, "LC_ALL": "C"}).stdout
+        m = re.search(r"^Description\s*:\s*(.+)$", info, re.M)
+        return T(f"Paquet {pkg} : {m.group(1).strip()}", f"Package {pkg}: {m.group(1).strip()}") if m else T(f"Paquet {pkg}.", f"Package {pkg}.")
+    except (OSError, subprocess.SubprocessError):
+        return None
+
+
+def describe(name, exe=None, cmd=None):
+    """Description en clair d'un groupe ou d'un programme. Dictionnaire, puis fichier
+    .desktop, puis paquet pacman ; le résultat est gardé en cache sur le disque."""
+    key = str(name).lower()
+    if key in DESCRIPTIONS:
+        return DESCRIPTIONS[key]
+    for pre, text in PREFIXES:
+        if key.startswith(pre):
+            return text
+    if exe and INTERPRETERS.match(os.path.basename(exe)) and cmd:
+        script = next((a for a in cmd[1:] if not a.startswith("-")), None)
+        return (T("Un script ", "A ") + os.path.basename(exe) + T("", " script") + (f"{T(' : ', ': ')}{script}" if script else "")
+                + T(". Déplie pour voir la commande complète.", ". Expand to see the full command."))
+    cache = _load_desc_cache()
+    ck = f"{key}|{exe or ''}"
+    if ck in cache:
+        return cache[ck]
+    if _desc_budget[0] <= 0:  # pas plus de quelques recherches par relevé
+        return None
+    _desc_budget[0] -= 1
+    d = _desktop_comment(name) or (_pacman_desc(exe) if exe and exe.startswith("/usr/") else None)
+    if not d and exe:
+        d = T(f"Programme {exe}", f"Program {exe}")
+    cache[ck] = d
+    _save_desc_cache()
+    return d
+
+
+def exe_of(pid):
+    try:
+        return os.readlink(f"/proc/{pid}/exe").replace(" (deleted)", "")
+    except OSError:
+        return None
+
+
+# ---------- matériel ----------
+
+def _lspci(addr):
+    import subprocess
+    try:
+        out = subprocess.run(["lspci", "-mm", "-s", addr], capture_output=True, text=True, timeout=3).stdout
+        f = re.findall(r'"([^"]*)"', out)
+        return (f[1], f[2]) if len(f) >= 3 else (None, None)
+    except (OSError, subprocess.SubprocessError):
+        return None, None
+
+
+def _short_vendor(v):
+    v = v or ""
+    for k, short in (("Advanced Micro Devices", "AMD"), ("NVIDIA", "NVIDIA"), ("Intel", "Intel"), ("Realtek", "Realtek"),
+                     ("MEDIATEK", "MediaTek"), ("Qualcomm", "Qualcomm"), ("Broadcom", "Broadcom")):
+        if k.lower() in v.lower():
+            return short
+    return v.split()[0] if v else ""
+
+
+def _disk_of(path):
+    """Disque physique qui porte `path` (en traversant LUKS, LVM…)."""
+    try:
+        dev = os.stat(path).st_dev
+        sysp = f"/sys/dev/block/{os.major(dev)}:{os.minor(dev)}"
+        name = os.path.basename(os.path.realpath(sysp)) if os.path.exists(sysp) else None
+    except OSError:
+        name = None
+    if not name:  # btrfs : st_dev est un périphérique anonyme, on passe par /proc/mounts
+        src = next((l.split()[0] for l in open("/proc/mounts") if l.split()[1] == path), "")
+        name = os.path.basename(os.path.realpath(src)) if src.startswith("/dev/") else None
+    seen = 0
+    while name and seen < 6:
+        seen += 1
+        slaves = glob.glob(f"/sys/class/block/{name}/slaves/*")
+        if slaves:
+            name = os.path.basename(slaves[0])
+            continue
+        parent = os.path.basename(os.path.dirname(os.path.realpath(f"/sys/class/block/{name}")))
+        if os.path.exists(f"/sys/class/block/{name}/partition") and parent:
+            name = parent
+            continue
+        return name
+    return name
+
+
+def hardware():
+    """Le nom du matériel, pour l'afficher à côté des titres."""
+    hw = {}
+    m = re.search(r"^model name\s*:\s*(.+)$", read("/proc/cpuinfo") or "", re.M)
+    if m:
+        name = re.sub(r"\s+\d+-Core Processor|\s+Processor|\(R\)|\(TM\)|CPU @.*", "", m.group(1)).strip()
+        cores = len(set(re.findall(r"^core id\s*:\s*(\d+)", read("/proc/cpuinfo") or "", re.M))) or NCPU
+        hw["cpu"] = f"{name} · {cores} " + T(f"cœurs, {NCPU} fils", f"cores, {NCPU} threads")
+    total = meminfo()["MemTotal"]
+    installed = 2 ** round(__import__("math").log2(total / GO)) if total else 0
+    hw["mem"] = T(f"{installed} Go installés", f"{installed} GB installed") if installed else ""
+
+    disk = _disk_of("/")
+    if disk:
+        model = (read(f"/sys/block/{disk}/device/model") or "").strip()
+        size = int(read(f"/sys/block/{disk}/size") or 0) * 512 / 1e12
+        if re.search(r"\d+\s*[TG]B\b", model):
+            hw["disk"] = model  # le modèle dit déjà sa taille
+        else:
+            hw["disk"] = f"{model or disk} · {size:.0f} {T('To', 'TB')}" if size >= 1 else f"{model or disk} · {size * 1000:.0f} {GO_U}"
+
+    for card in sorted(glob.glob("/sys/class/drm/card*/device")):
+        if first_int(f"{card}/gpu_busy_percent") is None and not os.path.exists(f"{card}/mem_info_vram_total"):
+            continue
+        vendor, dev = _lspci(os.path.basename(os.path.realpath(card)))
+        if not dev:
+            continue
+        name = re.sub(r"^.*\[(.+)\]$", r"\1", dev)
+        vram = (first_int(f"{card}/mem_info_vram_total") or 0) / GO
+        m = re.match(r"(.*?)(\d{4}) XT / (\d{4}) XT", name)
+        if m:  # le pilote annonce deux modèles : la VRAM tranche (12 Go → le premier, 16 Go → le second)
+            name = f"{m.group(1)}{m.group(3) if vram >= 15 else m.group(2)} XT"
+        hw["gpu"] = f"{_short_vendor(vendor)} {name}".strip() + (f" · {vram:.0f} {GO_U} VRAM" if vram else "")
+        break
+
+    route = (read("/proc/net/route") or "").splitlines()[1:]
+    iface = next((l.split()[0] for l in route if l.split()[1] == "00000000"), None)
+    if iface:
+        vendor, dev = _lspci(os.path.basename(os.path.realpath(f"/sys/class/net/{iface}/device")))
+        speed = first_int(f"/sys/class/net/{iface}/speed")
+        kind = "Wi-Fi" if os.path.exists(f"/sys/class/net/{iface}/wireless") else "Ethernet"
+        chip = re.split(r"[ /]", dev)[0] if dev else iface
+        hw["net"] = f"{_short_vendor(vendor)} {chip} · {kind}" + (f" {speed // 1000} Gb/s" if speed and speed >= 1000 else f" {speed} Mb/s" if speed and speed > 0 else "")
+    return hw
+
+
+_spaces_cache = {"t": 0, "v": {}}
+
+
+def herdr_spaces():
+    """terminal Herdr -> nom de son espace (relu toutes les 30 s, seulement fenêtre ouverte)."""
+    if time.time() - _spaces_cache["t"] < 30:
+        return _spaces_cache["v"]
+    import subprocess
+    m = {}
+    try:
+        ls = json.loads(subprocess.run(["herdr-app", "ls"], capture_output=True, text=True, timeout=3).stdout)
+        for sp in ls.get("spaces", []):
+            for tb in sp.get("tabs", []):
+                for t in tb.get("terminals", []):
+                    m[t.get("terminal")] = sp.get("name")
+    except (OSError, ValueError, subprocess.SubprocessError):
+        pass
+    _spaces_cache.update(t=time.time(), v=m)
+    return m
+
+
+# ---------- regroupement ----------
+
+GENERIC = re.compile(r"(wayland-wm@|session\.slice/[^/]*$|init\.scope$|user@\d+\.service/init\.scope)")
+
+
+def label_app(p):
+    cg = p["cgroup"].encode().decode("unicode_escape", errors="ignore")
+    if GENERIC.search(cg):
+        return p["comm"]
+    if re.search(r"/hc-hold-[0-9a-f]+\.service$", cg):
+        return "herdr · terminaux"
+    m = re.search(r"app-(?:Hyprland-|flatpak-)?([^/]+?)(?:@[^/]*)?-[0-9a-f]+\.scope$", cg) or \
+        re.search(r"app-(?:Hyprland-|flatpak-)?([^/]+?)(?:@[^/]*)?\.service$", cg)
+    if m:
+        name = m.group(1)
+        return name.split(".")[-1] if name.count(".") >= 2 else name  # org.chromium.Chromium -> Chromium
+    m = re.search(r"/([^/]+)\.(service|scope)$", cg)
+    return m.group(1) if m else p["comm"]
+
+
+def mcp_name(p):
+    """Nom lisible d'un enfant de claude : le paquet lancé plutôt que npm, uv ou node."""
+    argv = p["argv"]
+    if len(argv) == 1 and " " in argv[0].strip():  # npm réécrit son titre en une seule chaîne
+        argv = argv[0].split()
+    prog = os.path.basename(argv[0])
+    if prog.startswith("gk_"):
+        return "gitkraken"
+    if prog in ("bash", "sh", "zsh"):
+        return "shell"
+    if prog in ("npm", "npx", "uv", "uvx", "node", "bun", "bunx", "pnpm") or prog.startswith("python"):
+        for a in argv[1:]:
+            if a.startswith("-") or a in ("exec", "tool", "run", "x", "uvx", "dlx", "--"):
+                continue
+            if not a.startswith("@") or a.count("@") > 1:
+                a = re.sub(r"@[\w.^~-]+$", "", a)
+            return os.path.basename(a.split("/")[-1]) or prog
+    return prog
+
+
+def group_processes(procs, sessions):
+    def claude_root(pid):
+        seen = set()
+        while pid in procs and pid not in seen:
+            seen.add(pid)
+            if pid in sessions:
+                return pid
+            pid = procs[pid]["ppid"]
+        return None
+
+    groups = {}
+    for pid, p in procs.items():
+        root = claude_root(pid)
+        key = ("claude", root) if root else ("app", label_app(p))
+        g = groups.setdefault(key, dict(kind=key[0], key=key[1], pids=[], ram=0, swap=0, cpu=0, cmds={}, cmdmem={}))
+        g["pids"].append(pid)
+        g["ram"] += p["ram"]
+        g["swap"] += p["swap"]
+        g["cpu"] += p["cpu"]
+        name = p["comm"]
+        if key[0] == "claude" and pid != root:
+            top = pid  # rangé sous l'enfant direct de claude qui l'a lancé (un MCP, un shell…)
+            while procs[top]["ppid"] != root and procs[top]["ppid"] in procs:
+                top = procs[top]["ppid"]
+            name = mcp_name(procs[top])
+        p["group"] = f"{key[0]}:{key[1]}"
+        p["label"] = name
+        g["cmds"][name] = g["cmds"].get(name, 0) + 1
+        g["cmdmem"][name] = g["cmdmem"].get(name, 0) + p["ram"] + p["swap"]
+    return groups
+
+
+def protected(p):
+    return p["pid"] in (1, os.getpid()) or p["uid"] != UID or p["comm"] in PROTECTED
+
+
+# ---------- bilan ----------
+
+class Tracker:
+    """Garde les relevés précédents pour calculer des vitesses (CPU, réseau, disque)
+    et depuis quand chaque groupe ne fait plus rien."""
+
+    def __init__(self):
+        self.t = None
+        self.cpu = None
+        self.net = None
+        self.disk = None
+        self.proc_cpu = {}
+        self.group_seen_active = {}
+        self.boot = time.time() - float((read("/proc/uptime") or "0").split()[0])
+
+    def system(self):
+        now = time.time()
+        mi = meminfo()
+        z_used, z_orig = zram()
+        cpu, net, disk = cpu_times(), net_bytes(), disk_bytes()
+        out = dict(type="sys", time=now, has_claude=HAS_CLAUDE, total=mi["MemTotal"], used=mi["MemTotal"] - mi["MemAvailable"],
+                   available=mi["MemAvailable"], swap_used=mi["SwapTotal"] - mi["SwapFree"],
+                   zram=dict(used=z_used, data=z_orig), load=os.getloadavg(),
+                   uptime=now - self.boot, disks=disk_usage(), gpu=gpu(), cpu_temp=cpu_temp(), ncpu=NCPU)
+        if self.t is not None:
+            dt = max(now - self.t, 1e-3)
+            pct = [100 * (b[0] - a[0]) / max(b[1] - a[1], 1) for a, b in zip(self.cpu, cpu)]
+            out.update(cpu=pct[0], cores=pct[1:],
+                       net=dict(rx=(net[0] - self.net[0]) / dt, tx=(net[1] - self.net[1]) / dt),
+                       disk=dict(read=(disk[0] - self.disk[0]) / dt, write=(disk[1] - self.disk[1]) / dt))
+        else:
+            out.update(cpu=0, cores=[0] * (len(cpu) - 1), net=dict(rx=0, tx=0), disk=dict(read=0, write=0))
+        self.t, self.cpu, self.net, self.disk = now, cpu, net, disk
+        return out
+
+    def bilan(self, pads_max_age=0, with_procs=False):
+        now = time.time()
+        mi = meminfo()
+        total = mi["MemTotal"]
+        used = total - mi["MemAvailable"]
+        z_used, z_orig = zram()
+        procs = processes()
+        sessions = {pid: s for pid, s in claude_sessions().items() if pid in procs}
+        groups = group_processes(procs, sessions)
+        pads = scratchpads(pads_max_age)
+
+        # CPU par processus depuis le relevé précédent, en % de la machine entière
+        prev, self.proc_cpu = self.proc_cpu, {}
+        dt = getattr(self, "_bt", None)
+        dt = (now - dt) if dt else None
+        self._bt = now
+        for pid, p in procs.items():
+            key = (pid, p["start"])
+            self.proc_cpu[key] = p["cpu"]
+            p["cpu_pct"] = (100 * (p["cpu"] - prev[key]) / HZ / dt / NCPU) if dt and key in prev else 0.0
+
+        swap_used = mi["SwapTotal"] - mi["SwapFree"]
+        swap_procs = sum(g["swap"] for g in groups.values())
+        swap_other = max(0, swap_used - swap_procs)  # surtout des pages de /tmp
+        ratio = z_used / swap_used if swap_used and z_orig else 0  # RAM occupée par Go swappé
+
+        live_sids = {}
+        for pid, s in sessions.items():
+            live_sids.setdefault(s["sessionId"], []).append(pid)
+        owner = {sid: max(pids, key=lambda q: sessions[q].get("updatedAt", 0)) for sid, pids in live_sids.items()}
+
+        _desc_budget[0] = 8
+        rows = []
+        for (kind, key), g in groups.items():
+            gid = f"{kind}:{key}"
+            cpu_pct = sum(procs[pid]["cpu_pct"] for pid in g["pids"])
+            if cpu_pct > 0.5 or gid not in self.group_seen_active:
+                self.group_seen_active[gid] = now
+            roots = [pid for pid in g["pids"] if procs[pid]["ppid"] not in g["pids"]]
+            row = dict(id=gid, kind=kind, ram=g["ram"], zram=g["swap"] * ratio, swapped=g["swap"],
+                       procs=len(g["pids"]), cpu=cpu_pct, roots=roots,
+                       protected=all(protected(procs[pid]) for pid in roots),
+                       paused=all(procs[pid]["state"] == "T" for pid in roots),
+                       cmds=sorted(g["cmds"].items(), key=lambda x: -x[1]), cmdmem=g["cmdmem"],
+                       idle=now - self.group_seen_active[gid])
+            if kind == "claude":
+                s = sessions[key]
+                sid = s["sessionId"]
+                pad = pads.get(sid, (0, None)) if owner.get(sid) == key else (0, None)
+                last = s.get("updatedAt", s.get("startedAt", 0)) / 1000
+                env = read(f"/proc/{key}/environ", binary=True) or b""
+                m_t = re.search(rb"(?:^|\0)HC_TERMINAL_ID=([^\0]+)", env)
+                row["terminal"] = m_t.group(1).decode() if m_t else None
+                row["space"] = herdr_spaces().get(row["terminal"]) if with_procs else None
+                row.update(name=s.get("name") or os.path.basename(s.get("cwd", "")),
+                           session=sid, pid=key, cwd=s.get("cwd"), status=s.get("status"),
+                           age=now - (self.boot + procs[key]["start"] / HZ), idle=now - last,
+                           scratch_size=pad[0], scratch_path=pad[1],
+                           twins=[sessions[q].get("name") for q in live_sids.get(sid, []) if q != key])
+                mcps = [c for c in g["cmds"] if c not in ("claude", "shell")]
+                row["desc"] = T(f"Session Claude Code « {row['name']} » dans {s.get('cwd', '?')}. "
+                                + (f"Elle a lancé {len(mcps)} serveurs MCP : {', '.join(mcps)}. " if mcps else "")
+                                + "La facture compte aussi sa part de zram et son dossier /tmp. "
+                                + "« fermer » l'arrête ; elle se reprend avec claude --resume.",
+                                f"Claude Code session “{row['name']}” in {s.get('cwd', '?')}. "
+                                + (f"It started {len(mcps)} MCP servers: {', '.join(mcps)}. " if mcps else "")
+                                + "Its bill also counts its share of zram and its /tmp folder. "
+                                + "“Close” stops it; resume it with claude --resume.")
+            else:
+                row.update(name=T(key, "herdr · terminals") if key == "herdr · terminaux" else key)
+                row["desc"] = describe(key, exe_of(roots[0]) if roots else None, procs[roots[0]]["argv"] if roots else None)
+            rows.append(row)
+
+        tmpfs = tmpfs_mounts()
+        tmpfs_total = sum(u for _, u in tmpfs)
+        pss_shmem = sum(p["shm"] for p in procs.values())
+        files_ram = max(0, mi["Shmem"] - pss_shmem)
+        files_zram = swap_other * ratio
+        tmp_factor = (files_ram + files_zram) / tmpfs_total if tmpfs_total else 0
+
+        for r in rows:
+            if r["kind"] == "claude":
+                r["scratch"] = r["scratch_size"] * tmp_factor
+                r["facture"] = r["ram"] + r["zram"] + r["scratch"]
+            r["poids_mort"] = (r["ram"] + r["zram"] + r.get("scratch", 0)) / GO * r["idle"] / 3600
+
+        orphans = []
+        for sid, (sz, path) in pads.items():
+            if sid not in live_sids and sz > 0:
+                orphans.append(dict(session=sid, size=sz, cost=sz * tmp_factor, path=path))
+        orphans.sort(key=lambda o: -o["size"])
+
+        kernel = sum(mi.get(k, 0) for k in ("SUnreclaim", "KernelStack", "PageTables", "SecPageTables", "Percpu"))
+        reserve = kernel_reserve()
+        g = gpu()
+        explained = sum(r["ram"] + r["zram"] for r in rows) + files_ram + files_zram + kernel + reserve + g["gtt"]
+
+        clones, mem = {}, {}
+        for r in rows:
+            if r["kind"] == "claude":
+                for c, n in r["cmds"]:
+                    if c not in ("claude", "shell"):
+                        clones[c] = clones.get(c, 0) + 1
+                        mem[c] = mem.get(c, 0) + r["cmdmem"].get(c, 0)
+
+        rows.sort(key=lambda r: -(r["ram"] + r["zram"]))
+        out = dict(
+            type="full", time=now, total=total, used=used, available=mi["MemAvailable"], has_claude=HAS_CLAUDE,
+            zram=dict(used=z_used, data=z_orig),
+            groups=rows,
+            clones=sorted(({"name": c, "count": n, "mem": mem[c]} for c, n in clones.items() if n >= 3),
+                          key=lambda x: -x["mem"]),
+            personne=dict(files_ram=files_ram, files_zram=files_zram, tmpfs=tmpfs, tmpfs_total=tmpfs_total,
+                          orphans=orphans, kernel=kernel, reserve=reserve, gpu=g["gtt"], tmp_factor=tmp_factor),
+            ecart=used - explained,
+        )
+        if with_procs:
+            labels = {}
+            for p in procs.values():
+                if p["label"] not in labels:
+                    labels[p["label"]] = describe(p["label"], exe_of(p["pid"]), p["argv"])
+            out["descs"] = {k: v for k, v in labels.items() if v}
+            out["procs"] = [dict(pid=p["pid"], name=p["comm"], label=p["label"], group=p["group"],
+                                 cmd=" ".join(p["argv"])[:160], ram=p["ram"], swap=p["swap"] * ratio,
+                                 cpu=p["cpu_pct"], state=p["state"], nice=p["nice"], protected=protected(p))
+                            for p in procs.values()]
+        return out
+
+
+def bilan():
+    return Tracker().bilan()
+
+
+# ---------- libérer de la place ----------
+
+def panier(target, b=None):
+    """Ce qu'il est le moins gênant de fermer pour libérer `target` octets.
+    Ordre : scratchpads orphelins, doublons de conversation, sessions Claude endormies,
+    puis applis endormies, chaque fois les plus lourdes à dormir d'abord (poids mort)."""
+    b = b or Tracker().bilan()
+    cands = []
+    for o in b["personne"]["orphans"]:
+        if o["cost"] > 1024 ** 2:
+            cands.append(dict(kind="vider", id=f"vider:{o['session']}", gain=o["cost"], pain=0,
+                              label=T(f"scratchpad de la session fermée {o['session'][:8]}", f"scratchpad of closed session {o['session'][:8]}")))
+    for g in b["groups"]:
+        if g["kind"] == "claude" and g["twins"] and not g["scratch_size"] and g["idle"] > 600:
+            cands.append(dict(kind="session", id=f"session:{g['pid']}", gain=g["ram"] + g["zram"], pain=1,
+                              label=g['name'] + T(" (ouverte deux fois)", " (open twice)"), idle=g["idle"]))
+    for g in sorted((g for g in b["groups"] if g["kind"] == "claude" and not g["twins"] and g["idle"] > 1800),
+                    key=lambda g: -g["poids_mort"]):
+        gain = g["facture"]
+        item_id = f"session:{g['pid']}" + (f",vider:{g['session']}" if g["scratch_size"] else "")
+        cands.append(dict(kind="session", id=item_id, gain=gain, pain=2, idle=g["idle"],
+                          label=f"session {g['name']}"))
+    for g in sorted((g for g in b["groups"] if g["kind"] == "app" and not g["protected"]
+                     and g["idle"] > 3600 and g["ram"] + g["zram"] > 50 * 1024 ** 2),
+                    key=lambda g: -g["poids_mort"]):
+        cands.append(dict(kind="app", id="app:" + "+".join(map(str, g["roots"])), gain=g["ram"] + g["zram"],
+                          pain=3, idle=g["idle"], label=T("appli ", "app ") + g['name']))
+    chosen, total = [], 0
+    for c in cands:
+        if total >= target:
+            break
+        chosen.append(c)
+        total += c["gain"]
+    return dict(target=target, total=total, enough=total >= target * 0.95, items=chosen)
+
+
+# ---------- actions ----------
+
+def fermer(pid, quiet=False):
+    sessions = claude_sessions()
+    if pid not in sessions or not os.path.exists(f"/proc/{pid}"):
+        sys.exit(T(f"{pid} n'est pas une session Claude en cours", f"{pid} is not a running Claude session"))
+    os.kill(pid, signal.SIGTERM)
+    if not quiet:
+        print(T(f"session {sessions[pid].get('name')} arrêtée ; reprise : claude --resume {sessions[pid]['sessionId']}",
+                f"session {sessions[pid].get('name')} stopped; resume: claude --resume {sessions[pid]['sessionId']}"))
+    return sessions[pid]["sessionId"]
+
+
+def vider(sid, wait=0):
+    if not re.fullmatch(r"[0-9a-f-]{36}", sid):
+        sys.exit(T("id de session invalide", "invalid session id"))
+    deadline = time.time() + wait
+    while True:
+        live = {s["sessionId"] for pid, s in claude_sessions().items() if os.path.exists(f"/proc/{pid}")}
+        if sid not in live:
+            break
+        if time.time() >= deadline:
+            sys.exit(T("cette session tourne encore : demande-lui de faire le ménage, ou ferme-la d'abord",
+                       "this session is still running: ask it to clean up, or close it first"))
+        time.sleep(0.3)
+    for path in glob.glob(f"/tmp/claude-{UID}/*/{sid}"):
+        real = os.path.realpath(path)
+        if real.startswith(f"/tmp/claude-{UID}/") and os.path.isdir(real):
+            shutil.rmtree(real, ignore_errors=True)
+            print(T("supprimé : ", "deleted: ") + real)
+
+
+def montrer(pid):
+    """Affiche la conversation d'une session Claude dans Herdr et met Herdr devant.
+    Passe par le mod Pilote (« pilote-outils.aller-<espace>:<terminal> ») qui décide de ce
+    que montre la fenêtre ; sans lui, se rabat sur les commandes de Herdr."""
+    import subprocess
+    env = read(f"/proc/{pid}/environ", binary=True) or b""
+    m = re.search(rb"(?:^|\0)HC_TERMINAL_ID=([^\0]+)", env)
+    if not m:
+        sys.exit(T("cette session ne tourne pas dans Herdr", "this session is not running in Herdr"))
+    term = m.group(1).decode()
+    try:
+        ls = json.loads(subprocess.run(["herdr-app", "ls"], capture_output=True, text=True, timeout=5).stdout)
+    except (OSError, ValueError, subprocess.SubprocessError):
+        sys.exit(T("Herdr ne répond pas (la fenêtre est-elle ouverte ?)", "Herdr is not responding (is its window open?)"))
+    where = None
+    for sp in ls.get("spaces", []):
+        for tb in sp.get("tabs", []):
+            if any(t.get("terminal") == term for t in tb.get("terminals", [])):
+                where = (sp["id"], tb["id"], sp.get("name"))
+    if not where:
+        sys.exit(T(f"le terminal {term} n'est dans aucun espace de Herdr", f"terminal {term} is not in any Herdr space"))
+    r = subprocess.run(["herdr-app", "do", f"pilote-outils.aller-{where[0]}:{term}"], capture_output=True, text=True)
+    if r.returncode != 0 or '"error"' in r.stdout:  # pas de Pilote : les commandes de Herdr
+        subprocess.run(["herdr-app", "do", "space.select", "--id", where[0]], capture_output=True)
+        subprocess.run(["herdr-app", "do", "tab.select", "--id", where[1]], capture_output=True)
+        subprocess.run(["herdr-app", "do", "pane.focus", "--terminal", term], capture_output=True)
+    subprocess.run(["hyprctl", "dispatch", "focuswindow", "class:herdr-app"], capture_output=True)
+    print(T(f"conversation affichée dans Herdr ({where[2]})", f"conversation shown in Herdr ({where[2]})"))
+
+
+def analyser(raison=None):
+    """Écrit un relevé complet et ouvre une conversation Claude Code pour l'analyser, dans
+    l'espace Herdr choisi (ARDOISE_ESPACE, réglage « herdrSpace »), sinon un espace « Ardoise »
+    créé au besoin ; dans un terminal si Herdr n'est pas là. Sans Claude Code : erreur."""
+    if not HAS_CLAUDE:
+        print(T("Claude Code n'est pas installé (commande « claude » introuvable) : l'analyse est impossible.",
+                "Claude Code is not installed (no “claude” command): analysis is unavailable."), file=sys.stderr)
+        sys.exit(1)
+    import io
+    import contextlib
+    import subprocess
+    tr = Tracker()
+    tr.bilan(pads_max_age=0)
+    time.sleep(1.5)  # un deuxième relevé pour avoir le CPU
+    b = tr.bilan(pads_max_age=30, with_procs=True)
+    pct = 100 * b["used"] / b["total"]
+    raison = raison or T(f"RAM à {pct:.0f} %", f"RAM at {pct:.0f}%")
+    buf = io.StringIO()
+    with contextlib.redirect_stdout(buf):
+        show(b, False)
+    descs = b.get("descs", {})
+    procs = sorted(b["procs"], key=lambda p: -(p["ram"] + p["swap"]))[:20]
+    events, leaks = [], []
+    try:
+        for l in open(HISTORY):
+            r = json.loads(l)
+            if r.get("k") == "event" and r["t"] > time.time() - 3 * 3600:
+                events.append(r)
+    except (OSError, ValueError):
+        pass
+    leaks = [e for e in events if e.get("kind") == "leak"]
+    lines = [
+        T(f"# Relevé Ardoise du {time.strftime('%d/%m/%Y à %H:%M')}", f"# Ardoise report, {time.strftime('%Y-%m-%d %H:%M')}"),
+        "",
+        T(f"Raison : {raison}.", f"Reason: {raison}."),
+        "",
+        T("## Bilan (la somme des lignes fait la RAM utilisée)", "## Breakdown (the lines add up to the RAM in use)"),
+        "```text", buf.getvalue().rstrip(), "```",
+        "",
+        T("## Les plus gros groupes, et ce qu'ils sont", "## The biggest groups, and what they are"),
+    ]
+    for g in [g for g in b["groups"]][:15]:
+        kind_ = T("session Claude", "Claude session") if g['kind'] == 'claude' else T("appli", "app")
+        lines.append(f"- **{g['name']}** ({kind_}){T(' : ', ': ')}"
+                     f"{_gb(g['ram'] + g['zram'])}, {g['procs']} {T('processus', 'processes')}, "
+                     f"{T('calme depuis', 'idle for')} {dur(g['idle']).strip()}"
+                     + (f", /tmp {_gb(g.get('scratch', 0))}" if g.get('scratch', 0) > 50 * 1024 ** 2 else "")
+                     + (f", pid {g['pid']}" if g['kind'] == 'claude' else f", {T('pids racines', 'root pids')} {g['roots'][:5]}")
+                     + f". {g.get('desc') or ''}")
+    lines += ["", T("## Les 20 plus gros processus", "## The 20 biggest processes"), "",
+              T("| pid | programme | RAM | CPU | commande |", "| pid | program | RAM | CPU | command |"), "|---|---|---|---|---|"]
+    for p_ in procs:
+        lines.append(f"| {p_['pid']} | {p_['label']} | {_gb(p_['ram'] + p_['swap'])} | {p_['cpu']:.1f} % | `{p_['cmd'][:90].replace('|', '/')}` |")
+    lines += ["", T("## Événements des 3 dernières heures", "## Events of the last 3 hours"), ""]
+    lines += [f"- {time.strftime('%H:%M', time.localtime(e['t']))} {e['text']}" for e in events[-25:]] or [T("- aucun", "- none")]
+    if leaks:
+        lines += ["", T("Fuites signalées : ", "Reported leaks: ") + ", ".join(e["text"] for e in leaks)]
+    for go_ in (2, 4):
+        pn = panier(go_ * GO, b)
+        lines += ["", T(f"## Ce qu'Ardoise fermerait pour libérer {go_} Go (≈ {_gb(pn['total'])})",
+                        f"## What Ardoise would close to free {go_} GB (≈ {_gb(pn['total'])})"), ""]
+        lines += [f"- {i['label']}{T(' : ', ': ')}{_gb(i['gain'])} (`ardoise appliquer {i['id']}`)" for i in pn["items"]] \
+            or [T("- rien sans toucher à ce qui travaille", "- nothing without touching what is working")]
+    lines += ["", T("## Ce que j'attends de toi", "## What I expect from you"), ""] + (
+        ["1. Explique-moi en clair pourquoi la mémoire est dans cet état : qui la prend, ce qui est normal, "
+         "ce qui ne l'est pas (fuites, conversations ouvertes deux fois, sessions endormies, /tmp, MCP en double).",
+         "2. Vérifie ce qui te semble douteux avec les commandes ci-dessous plutôt que de supposer.",
+         "3. Propose un plan pour libérer de la mémoire, classé par gain et par risque, en disant ce que je perds à chaque étape.",
+         "4. N'arrête, ne ferme et ne supprime **rien** sans mon accord explicite, élément par élément.",
+         "", "Commandes : `ardoise` (bilan), `ardoise --json`, `ardoise liberer <Go>` (panier en JSON) ; "
+         "après mon accord : `ardoise fermer <pid>` (session Claude, reprise avec claude --resume), "
+         "`ardoise vider <id de session>`, `ardoise action pause|reprendre|terminer|tuer <pid>`."] if FR else
+        ["1. Explain in plain words why memory is in this state: who is using it, what is normal, "
+         "what is not (leaks, conversations open twice, idle sessions, /tmp, duplicated MCP servers).",
+         "2. Check anything that looks doubtful with the commands below instead of guessing.",
+         "3. Suggest a plan to free memory, ranked by gain and by risk, saying what I lose at each step.",
+         "4. Do not stop, close or delete **anything** without my explicit approval, item by item.",
+         "", "Commands: `ardoise` (breakdown), `ardoise --json`, `ardoise liberer <GB>` (basket as JSON); "
+         "after my approval: `ardoise fermer <pid>` (Claude session, resume with claude --resume), "
+         "`ardoise vider <session id>`, `ardoise action pause|reprendre|terminer|tuer <pid>`. "
+         "Answer in English."])
+    os.makedirs(os.path.join(STATE_DIR, "analyses"), exist_ok=True)
+    path = os.path.join(STATE_DIR, "analyses", time.strftime("%Y-%m-%d-%H%M%S") + ".md")
+    open(path, "w").write("\n".join(lines) + "\n")
+
+    task = T(f"Analyse la mémoire de ma machine : lis le relevé d'Ardoise dans {path} et suis les consignes de sa dernière section.",
+             f"Analyse my machine's memory: read the Ardoise report in {path} and follow the instructions in its last section.")
+    tab_name = T("Analyse RAM", "RAM analysis")
+    folder = os.path.dirname(os.path.realpath(__file__))
+    try:
+        ls = json.loads(subprocess.run(["herdr-app", "ls"], capture_output=True, text=True, timeout=5).stdout)
+    except (OSError, ValueError, subprocess.SubprocessError):
+        ls = None
+    if ls is None:
+        subprocess.Popen(["xdg-terminal-exec", "--dir=" + folder, "claude", task], start_new_session=True)
+        print(T(f"relevé : {path} ; Claude ouvert dans un terminal", f"report: {path}; Claude opened in a terminal"))
+        return
+    # l'espace choisi (ARDOISE_ESPACE, puis le réglage « herdrSpace » du plugin), sinon un espace « Ardoise »
+    wanted = os.environ.get("ARDOISE_ESPACE") or str(SETTINGS.get("herdrSpace") or "") or "Ardoise"
+    space = next((sp for sp in ls.get("spaces", []) if sp.get("name") == wanted), None) \
+        or next((sp for sp in ls.get("spaces", []) if sp.get("name") == "Ardoise"), None)
+    target = space["name"] if space else "Ardoise"
+    before = {t["terminal"] for sp in ls.get("spaces", []) for tb in sp["tabs"] for t in tb["terminals"]}
+    if space:
+        subprocess.run(["herdr-app", "do", "tab.new", "--space", space["id"], "--name", tab_name,
+                        "--argv", '["claude"]', "--task", task], capture_output=True)
+    else:
+        subprocess.run(["herdr-app", "do", "space.new", "--name", "Ardoise", "--folder", folder, "--tab", tab_name,
+                        "--argv", '["claude"]', "--task", task], capture_output=True)
+    # montrer la nouvelle conversation (le mod Pilote décide de ce qu'affiche la fenêtre)
+    for _ in range(20):
+        time.sleep(0.25)
+        try:
+            ls = json.loads(subprocess.run(["herdr-app", "ls"], capture_output=True, text=True, timeout=5).stdout)
+        except (OSError, ValueError, subprocess.SubprocessError):
+            break
+        new = [(sp["id"], t["terminal"]) for sp in ls.get("spaces", []) if sp.get("name") == target
+               for tb in sp["tabs"] for t in tb["terminals"] if t["terminal"] not in before]
+        if new:
+            subprocess.run(["herdr-app", "do", f"pilote-outils.aller-{new[0][0]}:{new[0][1]}"], capture_output=True)
+            break
+    subprocess.run(["hyprctl", "dispatch", "focuswindow", "class:herdr-app"], capture_output=True)
+    print(T(f"relevé : {path} ; analyse ouverte dans Herdr (espace {target})", f"report: {path}; analysis opened in Herdr (space {target})"))
+
+
+VERBS = {"pause": signal.SIGSTOP, "reprendre": signal.SIGCONT, "terminer": signal.SIGTERM, "tuer": signal.SIGKILL}
+
+
+def action(verb, pids):
+    procs = processes()
+    done = []
+    for pid in pids:
+        p = procs.get(pid)
+        if not p:
+            continue
+        if protected(p):
+            print(T(f"{p['comm']} ({pid}) est protégé : on n'y touche pas", f"{p['comm']} ({pid}) is protected: left alone"), file=sys.stderr)
+            continue
+        try:
+            if verb in VERBS:
+                os.kill(pid, VERBS[verb])
+            elif verb == "priorite":
+                os.setpriority(os.PRIO_PROCESS, pid, 10)
+            elif verb == "normal":
+                if p["nice"] > 0:
+                    try:
+                        os.setpriority(os.PRIO_PROCESS, pid, 0)
+                    except PermissionError:
+                        print(T(f"{p['comm']} ({pid}) : remonter la priorité demande les droits root", f"{p['comm']} ({pid}): raising priority needs root"), file=sys.stderr)
+                        continue
+            else:
+                sys.exit(T(f"verbe inconnu : {verb}", f"unknown verb: {verb}"))
+            done.append(f"{p['comm']} ({pid})")
+        except (ProcessLookupError, PermissionError) as e:
+            print(f"{p['comm']} ({pid}) : {e}", file=sys.stderr)
+    if not done:
+        sys.exit(T("rien n'a été fait", "nothing was done"))
+    print(f"{verb} : " + ", ".join(done))
+
+
+def appliquer(items):
+    for item in items:
+        for part in item.split(","):
+            kind, _, val = part.partition(":")
+            if kind == "session":
+                fermer(int(val))
+            elif kind == "vider":
+                vider(val, wait=8)
+            elif kind == "app":
+                action("terminer", [int(x) for x in val.split("+") if x])
+
+
+# ---------- affichage ----------
+
+def h(n):
+    n = float(n)
+    if abs(n) >= GO:
+        return f"{n / GO:5.1f} {GO_U}"
+    return f"{n / 1024 ** 2:5.0f} {MO_U}"
+
+
+def dur(s):
+    s = int(s)
+    if s >= 86400:
+        return f"{s // 86400} {T('j', 'd')} {s % 86400 // 3600} h"
+    if s >= 3600:
+        return f"{s // 3600} h {s % 3600 // 60:02d}"
+    return f"{s // 60} min"
+
+
+def bar(part, total, width=24):
+    n = round(width * part / total) if total else 0
+    return "█" * n + "·" * (width - n)
+
+
+def show(b, show_all=False):
+    U = b["used"]
+    print(T(f"RAM utilisée {h(U).strip()} sur {h(b['total']).strip()} ({100 * U / b['total']:.0f} %)   "
+            f"disponible {h(b['available']).strip()}",
+            f"RAM used {h(U).strip()} of {h(b['total']).strip()} ({100 * U / b['total']:.0f}%)   "
+            f"available {h(b['available']).strip()}"))
+    z = b["zram"]
+    if z["data"]:
+        print(T(f"zram : {h(z['data']).strip()} mis de côté, compressés en {h(z['used']).strip()} de RAM",
+                f"zram: {h(z['data']).strip()} set aside, compressed into {h(z['used']).strip()} of RAM"))
+    print()
+
+    claude = [g for g in b["groups"] if g["kind"] == "claude"]
+    apps = [g for g in b["groups"] if g["kind"] != "claude"]
+
+    if claude:
+        tot = sum(g["facture"] for g in claude)
+        n_mcp = sum(g["procs"] for g in claude) - len(claude)
+        print(T(f"SESSIONS CLAUDE ({len(claude)} session{"s" if len(claude) > 1 else ""}, {n_mcp} processus enfants)   facture totale {h(tot).strip()}",
+                f"CLAUDE SESSIONS ({len(claude)} session{"s" if len(claude) > 1 else ""}, {n_mcp} child processes)   total bill {h(tot).strip()}"))
+        print(f"  {'session':<26}{'RAM':>9}{'zram':>9}{'/tmp':>9}{T('= facture', '= bill'):>11}  {T('âge', 'age'):>8}  {T('calme', 'idle'):>8}  MCP")
+        for g in sorted(claude, key=lambda g: -g["facture"]):
+            mcp = len([c for c, n in g["cmds"] if c not in ("claude", "shell")])
+            name = g["name"] + (" (×2)" if g["twins"] else "")
+            print(f"  {name[:25]:<26}{h(g['ram']):>9}{h(g['zram']):>9}{h(g['scratch']):>9}"
+                  f"{h(g['facture']):>11}  {dur(g['age']):>8}  {dur(g['idle']):>8}  {mcp}")
+        for g in claude:
+            if g["twins"] and g["scratch_size"]:
+                print(T(f"  ! même conversation ouverte deux fois : {g['name']} et {', '.join(g['twins'])}",
+                        f"  ! same conversation open twice: {g['name']} and {', '.join(g['twins'])}"))
+        big = [g for g in claude if g["scratch_size"] > 100 * 1024 ** 2]
+        if big:
+            print(T("  (/tmp = coût réel du scratchpad en RAM ; il pèse ", "  (/tmp = real RAM cost of the scratchpad; it weighs ")
+                  + ", ".join(f"{g['name']} {h(g['scratch_size']).strip()}" for g in big)
+                  + T(" sur le disque mémoire)", " on the memory disk)"))
+        print()
+
+    print(T("APPLIS", "APPS"))
+    shown = apps if show_all else [g for g in apps if g["ram"] + g["zram"] >= 50 * 1024 ** 2]
+    for g in shown:
+        tot = g["ram"] + g["zram"]
+        extra = f"  ×{g['procs']}" if g["procs"] > 1 else ""
+        print(f"  {g['name'][:30]:<31}{h(tot):>9}  {bar(tot, U)}{extra}")
+    rest = [g for g in apps if g not in shown]
+    if rest:
+        print(f"  {'(' + str(len(rest)) + T(' petites applis)', ' small apps)'):<31}{h(sum(g['ram'] + g['zram'] for g in rest)):>9}")
+    print()
+
+    p = b["personne"]
+    print(T("PERSONNE (mémoire sans processus)", "NOBODY (memory without a process)"))
+    print(f"  {T('Fichiers en RAM (/tmp, shm)', 'Files in RAM (/tmp, shm)'):<31}{h(p['files_ram'] + p['files_zram']):>9}  "
+          f"{bar(p['files_ram'] + p['files_zram'], U)}")
+    live_pad = sum(g["scratch"] for g in claude)
+    if live_pad > 100 * 1024 ** 2:
+        print(T(f"    dont scratchpads des sessions  {h(live_pad):>9}  (déjà dans leur facture)",
+                f"    incl. session scratchpads      {h(live_pad):>9}  (already in their bill)"))
+    for mnt, used in sorted(p["tmpfs"], key=lambda x: -x[1])[:4]:
+        if used > 20 * 1024 ** 2:
+            print(f"    {mnt:<29}{h(used):>9}")
+    for o in p["orphans"][:5]:
+        if o["size"] > 1024 ** 2:
+            print(f"    {T('session fermée', 'closed session')} {o['session'][:8]}…{' ' * T(5, 4)}{h(o['cost']):>9}  {o['path']}")
+    print(f"  {T('Noyau', 'Kernel'):<31}{h(p['kernel']):>9}  {bar(p['kernel'], U)}")
+    print(f"  {T('Réserve du noyau', 'Kernel reserve'):<31}{h(p['reserve']):>9}  {bar(p['reserve'], U)}")
+    if p["gpu"]:
+        print(f"  {T('Carte graphique', 'Graphics card'):<31}{h(p['gpu']):>9}  {bar(p['gpu'], U)}")
+    print()
+    e = b["ecart"]
+    print(f"  {T('Écart non expliqué', 'Unexplained gap'):<31}{h(e):>9}  {bar(max(e, 0), U)}  "
+          + T(f"({100 * e / U:+.0f} % du total)", f"({100 * e / U:+.0f}% of total)"))
+    print(T("    (pilotes, cache verrouillé, mémoire que le noyau ne détaille pas)",
+            "    (drivers, locked cache, memory the kernel does not itemise)"))
+
+    if b["clones"]:
+        print()
+        print(T(f"CLONES (un exemplaire par session Claude)   {h(sum(c['mem'] for c in b['clones'])).strip()} au total",
+                f"CLONES (one copy per Claude session)   {h(sum(c['mem'] for c in b['clones'])).strip()} in total"))
+        for c in b["clones"][:8]:
+            print(f"  {c['count']:>3} × {c['name']:<26}{h(c['mem']):>9}  " + T("(RAM + swap, non compressé)", "(RAM + swap, uncompressed)"))
+
+
+# ---------- veilleur : historique, événements, fuites, alertes ----------
+
+STATE_DIR = os.path.join(os.environ.get("XDG_STATE_HOME", f"{HOME}/.local/state"), "ardoise")
+HISTORY = os.path.join(STATE_DIR, "historique.jsonl")
+KEEP_HOURS = 48
+
+
+def _gb(v):
+    if v >= GO:
+        return T(f"{v / GO:.1f} Go".replace(".", ","), f"{v / GO:.1f} GB")
+    return f"{v / 1024 ** 2:.0f} {MO_U}"
+
+
+class Watcher:
+    """Ce que le flux surveille dans le temps. Un seul flux (le « chef », qui tient un verrou)
+    écrit l'historique sur le disque et envoie les notifications ; les autres calculent
+    la même chose pour leur affichage, sans rien écrire."""
+
+    def __init__(self, threshold=85):
+        import fcntl
+        self.fcntl = fcntl
+        self.threshold = threshold
+        self.lock_file = None
+        self.leader = False
+        self.try_lead()
+        self.acc = []                 # relevés système de la minute en cours
+        self.minute_start = time.time()
+        self.breakdown = None         # dernière répartition [sessions, applis, /tmp, noyau, écart]
+        self.used = 0
+        self.prev_groups = None       # id -> (nom, mémoire, genre) au bilan précédent
+        self.known = None             # groupes établis (vus sur deux bilans de suite)
+        self.missing = {}             # id -> nombre de bilans où un groupe établi manque
+        self.mem_series = {}          # id -> [(t, mémoire)] pour les fuites
+        self.leaks = {}               # id -> pente en octets/heure
+        self.leak_notified = {}
+        self.over = 0
+        self.alerted_at = 0
+        self.alert_armed = True
+
+    def try_lead(self):
+        if self.leader:
+            return
+        try:
+            os.makedirs(STATE_DIR, exist_ok=True)
+            f = open(os.path.join(f"/run/user/{UID}", "ardoise.chef"), "w")
+            self.fcntl.flock(f, self.fcntl.LOCK_EX | self.fcntl.LOCK_NB)
+            self.lock_file, self.leader = f, True
+            self.trim()
+        except OSError:
+            self.leader = False
+
+    # -- historique --
+    def trim(self):
+        cutoff = time.time() - KEEP_HOURS * 3600
+        try:
+            lines = open(HISTORY).read().splitlines()
+        except OSError:
+            return
+        keep = [l for l in lines if l and json.loads(l).get("t", 0) >= cutoff]
+        if len(keep) != len(lines):
+            with open(HISTORY + ".tmp", "w") as f:
+                f.write("\n".join(keep) + ("\n" if keep else ""))
+            os.replace(HISTORY + ".tmp", HISTORY)
+
+    def write(self, rec):
+        if not self.leader:
+            return
+        try:
+            with open(HISTORY, "a") as f:
+                f.write(json.dumps(rec, ensure_ascii=False, separators=(",", ":")) + "\n")
+        except OSError:
+            pass
+
+    def backlog(self, hours=24):
+        cutoff = time.time() - hours * 3600
+        points, events = [], []
+        try:
+            for l in open(HISTORY):
+                try:
+                    r = json.loads(l)
+                except ValueError:
+                    continue
+                if r.get("t", 0) < cutoff:
+                    continue
+                (events if r.get("k") == "event" else points).append(r)
+        except OSError:
+            pass
+        return dict(type="hist", points=points, events=events)
+
+    def on_system(self, sysd):
+        """Accumule les relevés de 2 s ; toutes les minutes, rend un point d'historique."""
+        self.acc.append(sysd)
+        now = time.time()
+        if now - self.minute_start < 60 or not self.acc:
+            return None
+        n = len(self.acc)
+        avg = lambda f: sum(f(x) for x in self.acc) / n
+        point = dict(k="min", t=round(now), cpu=round(avg(lambda x: x["cpu"]), 1),
+                     used=round(avg(lambda x: x["used"])), total=self.acc[-1]["total"],
+                     rx=round(avg(lambda x: x["net"]["rx"])), tx=round(avg(lambda x: x["net"]["tx"])),
+                     rd=round(avg(lambda x: x["disk"]["read"])), wr=round(avg(lambda x: x["disk"]["write"])),
+                     gpu=round(avg(lambda x: x["gpu"]["busy"] or 0), 1),
+                     parts=[round(v) for v in self.breakdown] if self.breakdown else None)
+        self.acc = []
+        self.minute_start = now
+        self.write(point)
+        if self.leader and int(now) % 3600 < 60:
+            self.trim()
+        return dict(type="minute", point=point)
+
+    # -- bilans : événements, fuites, alertes --
+    def on_bilan(self, b):
+        now = time.time()
+        out = []
+        sess = sum(g["ram"] + g["zram"] for g in b["groups"] if g["kind"] == "claude")
+        apps = sum(g["ram"] + g["zram"] for g in b["groups"] if g["kind"] != "claude")
+        p = b["personne"]
+        self.breakdown = [sess, apps, p["files_ram"] + p["files_zram"], p["kernel"] + p["reserve"] + p["gpu"], max(0, b["ecart"])]
+        self.used = b["used"]
+
+        # ouvertures et fermetures : un groupe ne compte qu'une fois vu sur deux bilans de suite,
+        # et n'est déclaré fermé qu'absent de deux bilans (les processus éclairs ne font pas de bruit)
+        cur = {g["id"]: (g["name"], g["ram"] + g["zram"], g["kind"]) for g in b["groups"]}
+        notable = lambda kind, mem: kind == "claude" or mem > 150 * 1024 ** 2
+        if self.known is None:
+            self.known = dict(cur)
+        else:
+            for gid, (name, mem, kind) in cur.items():
+                self.missing.pop(gid, None)
+                if gid not in self.known and self.prev_groups and gid in self.prev_groups:
+                    self.known[gid] = cur[gid]
+                    if notable(kind, mem):
+                        out.append(self.event(now, "open", T(f"session {name} ouverte", f"session {name} opened") if kind == "claude" else T(f"{name} lancé ({_gb(mem)})", f"{name} started ({_gb(mem)})")))
+                elif gid in self.known:
+                    self.known[gid] = cur[gid]
+            for gid in list(self.known):
+                if gid in cur:
+                    continue
+                self.missing[gid] = self.missing.get(gid, 0) + 1
+                if self.missing[gid] >= 2:
+                    name, mem, kind = self.known.pop(gid)
+                    self.missing.pop(gid, None)
+                    if notable(kind, mem):
+                        out.append(self.event(now, "close", T(f"session {name} fermée", f"session {name} closed") if kind == "claude" else T(f"{name} fermé ({_gb(mem)} rendus)", f"{name} closed ({_gb(mem)} freed)")))
+        self.prev_groups = cur
+
+        # fuites : une mémoire qui monte sans arrêt depuis au moins 25 minutes
+        for gid, (name, mem, kind) in cur.items():
+            ser = self.mem_series.setdefault(gid, [])
+            if not ser or now - ser[-1][0] >= 55:
+                ser.append((now, mem))
+            while ser and now - ser[0][0] > 1800:
+                ser.pop(0)
+        for gid in list(self.mem_series):
+            if gid not in cur:
+                del self.mem_series[gid]
+                self.leaks.pop(gid, None)
+        for gid, ser in self.mem_series.items():
+            self.leaks.pop(gid, None)
+            if len(ser) < 20 or ser[-1][0] - ser[0][0] < 1500:
+                continue
+            xs = [t - ser[0][0] for t, _ in ser]
+            ys = [m for _, m in ser]
+            mx, my = sum(xs) / len(xs), sum(ys) / len(ys)
+            sxx = sum((x - mx) ** 2 for x in xs)
+            sxy = sum((x - mx) * (y - my) for x, y in zip(xs, ys))
+            syy = sum((y - my) ** 2 for y in ys)
+            if not sxx or not syy:
+                continue
+            slope = sxy / sxx * 3600
+            r2 = sxy * sxy / (sxx * syy)
+            if slope > 300 * 1024 ** 2 and r2 > 0.8 and ys[-1] - ys[0] > 200 * 1024 ** 2:
+                self.leaks[gid] = slope
+                if now - self.leak_notified.get(gid, 0) > 7200:
+                    self.leak_notified[gid] = now
+                    name = cur[gid][0]
+                    out.append(self.event(now, "leak", T(f"fuite probable : {name} (+{_gb(slope)}/h)", f"probable leak: {name} (+{_gb(slope)}/h)")))
+                    self.notify(T(f"Ardoise : {name} grossit sans arrêt", f"Ardoise: {name} keeps growing"),
+                                T(f"+{_gb(slope)} par heure depuis 30 min, il pèse {_gb(cur[gid][1])}. Une fuite de mémoire ?",
+                                  f"+{_gb(slope)} per hour for 30 min, now {_gb(cur[gid][1])}. A memory leak?"),
+                                urgency="normal", actions=True)
+        for g in b["groups"]:
+            g["leak"] = self.leaks.get(g["id"], 0)
+
+        # alerte : au-dessus du seuil sur deux bilans de suite, en nommant les coupables
+        pct = 100 * b["used"] / b["total"]
+        self.over = self.over + 1 if pct >= self.threshold else 0
+        if pct < self.threshold - 5:
+            self.alert_armed = True
+        if self.over >= 2 and (self.alert_armed or now - self.alerted_at > 1800 and pct >= self.threshold + 5):
+            self.alert_armed = False
+            self.alerted_at = now
+            out.append(self.event(now, "alert", T(f"alerte : RAM à {pct:.0f} %", f"alert: RAM at {pct:.0f}%")))
+            self.notify(T(f"RAM à {pct:.0f} % : voici qui la prend", f"RAM at {pct:.0f}%: here is who is using it"), self.culprits(b), urgency="critical", actions=True)
+        return out
+
+    def culprits(self, b):
+        p = b["personne"]
+        items = []
+        tmp = p["files_ram"] + p["files_zram"]
+        big_pad = max((g for g in b["groups"] if g["kind"] == "claude"), key=lambda g: g.get("scratch", 0), default=None)
+        tmp_note = T(f" (dont le scratchpad de {big_pad['name']} : {_gb(big_pad['scratch'])})", f" (incl. {big_pad['name']}'s scratchpad: {_gb(big_pad['scratch'])})") if big_pad and big_pad.get("scratch", 0) > 500 * 1024 ** 2 else ""
+        items.append((tmp, T("/tmp en RAM ", "/tmp in RAM ") + f"{_gb(tmp)}{tmp_note}"))
+        for g in b["groups"]:
+            mem = g["ram"] + g["zram"]
+            label = f"session {g['name']}" if g["kind"] == "claude" else g["name"]
+            items.append((mem, f"{label} {_gb(mem)}"))
+        sess = [g for g in b["groups"] if g["kind"] == "claude"]
+        if len(sess) > 3:
+            items.append((sum(g["ram"] + g["zram"] for g in sess), T(f"{len(sess)} sessions Claude en tout : ", f"{len(sess)} Claude sessions in all: ") + _gb(sum(g['ram'] + g['zram'] for g in sess))))
+        items.sort(key=lambda x: -x[0])
+        return "\n".join("• " + t for _, t in items[:4])
+
+    def event(self, now, kind, text):
+        rec = dict(k="event", t=round(now), kind=kind, text=text)
+        self.write(rec)
+        return dict(type="event", event=rec)
+
+    def notify(self, title, body, urgency="normal", actions=False):
+        if not self.leader:
+            return
+        import subprocess
+        cmd = ["omarchy-notification-send", "--app-name", "Ardoise", "-g", "󰍛", "-u", urgency, title, body]
+        if actions:
+            if HAS_CLAUDE:
+                cmd += ["--action", T("Analyser avec Claude", "Analyse with Claude"), os.path.realpath(__file__),
+                        "analyser", "--lang", LANG_, "--raison", title]
+            cmd += ["--action", T("Ouvrir Ardoise", "Open Ardoise"), "omarchy-shell", "io.github.smilecry44.ardoise", "openWindow"]
+        try:
+            subprocess.Popen(cmd, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, start_new_session=True)
+        except OSError:
+            try:
+                subprocess.Popen(["notify-send", "-a", "Ardoise", "-u", urgency, title, body], start_new_session=True)
+            except OSError:
+                pass
+
+
+# ---------- flux pour le widget ----------
+
+def flux():
+    """Une ligne JSON par relevé. Le système toutes les 2 s ; le bilan par catégorie
+    toutes les 30 s, ou toutes les 3 s avec le détail des processus quand la fenêtre
+    ou la carte est ouverte."""
+    tr = Tracker()
+    seuil = 85
+    if "--seuil" in sys.argv:
+        try:
+            seuil = float(sys.argv[sys.argv.index("--seuil") + 1])
+        except (IndexError, ValueError):
+            pass
+    w = Watcher(seuil)
+    opened = False
+
+    def emit(o):
+        sys.stdout.write(json.dumps(o, ensure_ascii=False, separators=(",", ":")) + "\n")
+
+    emit(dict(type="hw", hw=hardware()))
+    emit(w.backlog())
+    sys.stdout.flush()
+    last_full = 0
+    last_lead_try = time.time()
+    tr.system()
+    w.on_bilan(tr.bilan(pads_max_age=30))  # premier relevé CPU et état de départ
+    while True:
+        r, _, _ = select.select([sys.stdin], [], [], 2.0)
+        force = False
+        if r:
+            line = sys.stdin.readline()
+            if not line:
+                return  # le shell s'est arrêté
+            cmd = line.strip()
+            if cmd == "open":
+                opened, force = True, True
+            elif cmd == "close":
+                opened = False
+            elif cmd == "tick":
+                force = True
+        sysd = tr.system()
+        out = [sysd]
+        minute = w.on_system(sysd)
+        if minute:
+            out.append(minute)
+        since = time.time() - last_full
+        if (opened and (force or since >= 3)) or (not opened and since >= 30):
+            b = tr.bilan(pads_max_age=30, with_procs=opened)
+            out.extend(w.on_bilan(b))
+            out.append(b)
+            last_full = time.time()
+        if not w.leader and time.time() - last_lead_try > 30:  # le chef a peut-être disparu
+            w.try_lead()
+            last_lead_try = time.time()
+        for o in out:
+            emit(o)
+        sys.stdout.flush()
+
+
+USAGE_EN = """ardoise: who is using the machine, in lines that add up to the total.
+
+Usage: ardoise [--json] [--all]       readable breakdown, or JSON
+       ardoise --court                 percentage of RAM in use (for the bar)
+       ardoise --flux                  one JSON line every 2 s (for the widget);
+                                       reads "open" / "close" / "tick" on stdin
+       ardoise --flux --seuil 85       RAM alert threshold (%)
+       ardoise fermer <pid>            stop a Claude session (resume it with --resume)
+       ardoise vider <session id>      delete the scratchpad of a closed session
+       ardoise montrer <pid>           show a session's conversation in Herdr
+       ardoise analyser [--raison …]   full report + a Claude conversation to analyse it
+       ardoise action <verb> <pid>…    pause | reprendre | priorite | normal | terminer | tuer
+       ardoise liberer <GB>            suggest what to close to free that much (JSON)
+       ardoise appliquer <item>…       session:<pid> vider:<id> app:<pid+pid…>
+       --lang fr|en                    language (else ARDOISE_LANG, the plugin's "language"
+                                       setting in shell.json, then the system language)
+"""
+
+
+def main():
+    a = sys.argv[1:]
+    if a[:1] in (["-h"], ["--help"], ["aide"], ["help"]):
+        print(T(__doc__.replace("(ardoise: who is using the machine, in lines that add up to the total.)\n", ""), USAGE_EN))
+        return
+    if a[:1] == ["fermer"] and len(a) > 1:
+        return fermer(int(a[1]))
+    if a[:1] == ["vider"] and len(a) > 1:
+        return vider(a[1])
+    if a[:1] == ["analyser"]:
+        raison = a[a.index("--raison") + 1] if "--raison" in a and a.index("--raison") + 1 < len(a) else None
+        return analyser(raison)
+    if a[:1] == ["montrer"] and len(a) > 1:
+        return montrer(int(a[1]))
+    if a[:1] == ["action"] and len(a) > 2:
+        return action(a[1], [int(x) for x in a[2:]])
+    if a[:1] == ["liberer"] and len(a) > 1:
+        print(json.dumps(panier(float(a[1].rstrip("Gg").replace(",", ".")) * GO), ensure_ascii=False))
+        return
+    if a[:1] == ["appliquer"]:
+        return appliquer(a[1:])
+    if "--flux" in a:
+        signal.signal(signal.SIGPIPE, signal.SIG_DFL)
+        return flux()
+    if "--materiel" in a:
+        print(json.dumps(hardware(), ensure_ascii=False, indent=1))
+        return
+    if "--court" in a:
+        mi = meminfo()
+        print(round(100 * (mi["MemTotal"] - mi["MemAvailable"]) / mi["MemTotal"]))
+        return
+    b = bilan()
+    if "--json" in a:
+        json.dump(b, sys.stdout, ensure_ascii=False, indent=1)
+        print()
+    else:
+        show(b, "--all" in a)
+
+
+if __name__ == "__main__":
+    main()
