@@ -32,6 +32,15 @@ ardoise            # readable breakdown
 ardoise --json     # the same, as JSON
 ```
 
+## Remove
+
+```bash
+omarchy plugin remove io.github.smilecry44.ardoise
+rm -f ~/.local/bin/ardoise                       # if you linked the command
+rm -rf ~/.local/state/ardoise ~/.cache/ardoise   # history and description cache
+omarchy restart shell
+```
+
 ## Requirements
 
 - Omarchy with the Quickshell bar, Linux `/proc`, `python3` (standard library only).
