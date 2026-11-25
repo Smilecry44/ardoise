@@ -13,6 +13,8 @@ It also draws CPU, memory, network, disk and GPU charts (5 min, 1 h, 24 h), and 
 
 To free memory, **Analyze with Claude** opens a Claude Code conversation that reads a full report of the machine (groups, idle sessions, orphan scratchpads, a ranked list of what could be closed) and proposes a plan sorted by gain and risk. It changes nothing without your approval.
 
+Events (a session or app opening or closing, a memory leak, a RAM alert) show as small notches above the charts and in a folding log under the memory chart; hovering a log line marks that moment on every chart. Events too close to read apart merge into one notch: the most important one (alert, then leak, closing, opening) followed by how many there are. **log ↗** opens a window with every event over 1 h, 24 h or 48 h: the memory curve with a notch per event, filters, and the details of each one (effect on memory, RAM in use at that moment, the curve of a leak).
+
 The interface follows the system language: French or English.
 
 ![Ardoise](preview.png)
@@ -68,6 +70,7 @@ omarchy-shell io.github.smilecry44.ardoise openWindow
 omarchy-shell io.github.smilecry44.ardoise analyser        # open the Claude analysis
 omarchy-shell io.github.smilecry44.ardoise chercher firefox
 omarchy-shell io.github.smilecry44.ardoise vue 1h          # 5min | 1h | 24h
+omarchy-shell io.github.smilecry44.ardoise journal         # the events window
 ```
 
 ## What it touches

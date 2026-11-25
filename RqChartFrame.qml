@@ -11,20 +11,22 @@ Item {
   property string yMid: ""
   property string yBottom: "0"
   property real plotHeight: 60
+  property int notchH: 0      // bande des encoches d'événements, au-dessus de la courbe
   default property alias content: plot.data
   readonly property int axisW: Style.space(36)
   readonly property int axisH: Math.round(Style.font.caption * 1.4)
   readonly property color fg: Commons.Color.popups.text
   readonly property color dim: Qt.rgba(fg.r, fg.g, fg.b, 0.6)
-  readonly property var times: !hub ? ["", "", ""]
+  property var times: !hub ? ["", "", ""]
     : hub.range === "24h" ? ["−24 h", "−12 h", hub.t("maintenant", "now")]
     : hub.range === "1h" ? ["−1 h", "−30 min", hub.t("maintenant", "now")]
     : ["−5 min", "−2 min 30", hub.t("maintenant", "now")]
 
   width: parent ? parent.width : 0
-  implicitHeight: plotHeight + axisH
+  implicitHeight: notchH + plotHeight + axisH
 
   Item {
+    y: f.notchH
     width: f.axisW - Style.space(5); height: f.plotHeight
     Repeater {
       model: [{ t: f.yTop, y: 0 }, { t: f.yMid, y: 0.5 }, { t: f.yBottom, y: 1 }]
@@ -40,12 +42,12 @@ Item {
   }
   Item {
     id: plot
-    x: f.axisW
+    x: f.axisW; y: f.notchH
     width: f.width - f.axisW
     height: f.plotHeight
   }
   Item {
-    x: f.axisW; y: f.plotHeight + 1
+    x: f.axisW; y: f.notchH + f.plotHeight + 1
     width: f.width - f.axisW; height: f.axisH
     Repeater {
       model: f.times

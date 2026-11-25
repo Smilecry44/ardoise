@@ -59,6 +59,16 @@ PanelWindow {
     return p >= 10 ? Math.round(p) + " %" : p >= 0.1 ? (hub ? hub.num(p, 1) : p.toFixed(1)) + " %" : "—"
   }
 
+  readonly property int notchH: Style.space(12)
+  // Colonne du moment survolé dans le journal (trait fin sur les courbes), -1 : aucun.
+  function cursorFor(times) {
+    if (!hub || hub.hoverEventT <= 0 || !times || !times.length) return -1
+    var t = hub.hoverEventT
+    if (t < times[0] - 60 || t > times[times.length - 1] + 60) return -1
+    var i = 0
+    while (i < times.length - 1 && times[i] < t) i++
+    return i
+  }
   function glyphOf(kind) { return kind === "open" ? "▲" : kind === "close" ? "▼" : kind === "leak" ? "↗" : "!" }
   // Repères : pour chaque événement de la plage, l'index de la colonne où il tombe.
   function marksFor(times) {
@@ -69,7 +79,7 @@ PanelWindow {
       if (t < times[0] - 60 || t > times[times.length - 1] + 60) continue
       var i = 0
       while (i < times.length - 1 && times[i] < t) i++
-      out.push({ i: i, color: hub.eventColor(evs[e].kind), glyph: glyphOf(evs[e].kind) })
+      out.push({ i: i, color: hub.eventColor(evs[e].kind), glyph: glyphOf(evs[e].kind), p: ({ alert: 4, leak: 3, close: 2, open: 1 })[evs[e].kind] || 0 })
     }
     return out
   }
@@ -105,8 +115,8 @@ PanelWindow {
     if (key === "rx") { title = "↓ " + h.rate(v) + "  ↑ " + h.rate(v2); line = h.t("réseau : reçu / envoyé", "network: received / sent") }
     else if (key === "rd") { title = h.t("lu ", "read ") + h.rate(v) + h.t("  écrit ", "  written ") + h.rate(v2); line = h.t("disque : lu / écrit", "disk: read / written") }
     else { title = h.pctTxt(v); line = key === "gpu" ? h.t("charge du GPU", "GPU load") : h.t("charge du processeur", "CPU load") }
-    var span = h.range === "24h" ? 600 : h.range === "1h" ? 60 : 3
-    var evs = h.events.filter(function(e) { return t && Math.abs(e.t - t) <= span })
+    var colSec = times.length > 1 ? (times[times.length - 1] - times[0]) / (times.length - 1) : 2, span = Math.max(3, colSec * Math.ceil(g.markGap / g.step))
+    var evs = h.rangeEvents().filter(function(e) { return t && Math.abs(e.t - t) <= span }).reverse()
     var body = line + (evs.length ? "\n" + evs.map(function(e) { return h.hhmm(e.t) + "  " + e.text }).join("\n") : "")
     queueTip((t ? h.hhmm(t) + " · " : "") + title, body, g)
   }
@@ -356,6 +366,15 @@ PanelWindow {
             model: win.hub ? [{ t: win.tx("▲ ouvert", "▲ opened"), k: "open" }, { t: win.tx("▼ fermé", "▼ closed"), k: "close" }, { t: win.tx("↗ fuite", "↗ leak"), k: "leak" }, { t: win.tx("! alerte", "! alert"), k: "alert" }] : []
             RqText { height: parent.height; text: modelData.t; color: win.hub.eventColor(modelData.k); font.pixelSize: win.cap }
           }
+          Rectangle {
+            anchors.verticalCenter: parent.verticalCenter
+            height: Style.space(18); radius: Style.space(5)
+            width: journalBtn.implicitWidth + Style.space(14)
+            color: journalMa.containsMouse ? Qt.rgba(Commons.Color.accent.r, Commons.Color.accent.g, Commons.Color.accent.b, 0.15) : "transparent"
+            border.color: Qt.rgba(win.fg.r, win.fg.g, win.fg.b, 0.14)
+            RqText { id: journalBtn; anchors.centerIn: parent; text: win.tx("journal ↗", "log ↗"); color: Commons.Color.accent; font.pixelSize: win.cap }
+            MouseArea { id: journalMa; anchors.fill: parent; hoverEnabled: true; cursorShape: Qt.PointingHandCursor; onClicked: win.hub.openEvents() }
+          }
         }
       }
 
@@ -366,13 +385,14 @@ PanelWindow {
         subtitle: win.hub && win.hub.hw.cpu ? win.hub.hw.cpu : ""
         aside: win.hub && win.hub.sys ? win.hub.pctTxt(win.hub.sys.cpu) + (win.hub.sys.cpu_temp ? " · " + Math.round(win.hub.sys.cpu_temp) + "°" : "") : ""
         RqChartFrame {
-          hub: win.hub; yTop: "100"; yMid: "50"; yBottom: "0"
+          hub: win.hub; notchH: win.notchH; yTop: "100"; yMid: "50"; yBottom: "0"
           plotHeight: Style.space(118)
           RqGraph {
-            width: parent.width; height: parent.height
+            width: parent.width; y: -notch; height: parent.height + notch; notch: win.notchH
             values: win.hub ? win.hub.series("cpu", cols) : []
             MouseArea { anchors.fill: parent; hoverEnabled: true; onExited: win.leaveTip(parent); onPositionChanged: function(mouse) { win.graphTip(parent, mouse.x, "cpu") } }
             marks: win.marksFor(win.hub ? win.hub.seriesTimes("cpu", cols) : [])
+            cursor: win.cursorFor(win.hub ? win.hub.seriesTimes("cpu", cols) : [])
             maxValue: 100
             tint: win.hub ? win.hub.cApps : "white"
           }
@@ -423,16 +443,17 @@ PanelWindow {
         subtitle: win.hub && win.hub.hw.mem ? win.hub.hw.mem : ""
         aside: win.hub && win.hub.sys ? go(win.hub.sys.used) + " / " + go(win.hub.sys.total) : ""
         RqChartFrame {
-          hub: win.hub
+          hub: win.hub; notchH: win.notchH
           yTop: win.hub && win.hub.sys ? go(win.hub.sys.total) : ""
           yMid: win.hub && win.hub.sys ? go(win.hub.sys.total / 2) : ""
           yBottom: "0"
           plotHeight: Style.space(132)
           RqStackGraph {
             id: memGraph
-            width: parent.width; height: parent.height
+            width: parent.width; y: -notch; height: parent.height + notch; notch: win.notchH
             values: win.hub ? win.hub.series("parts", cols) : []
             marks: win.marksFor(win.hub ? win.hub.seriesTimes("parts", cols) : [])
+            cursor: win.cursorFor(win.hub ? win.hub.seriesTimes("parts", cols) : [])
             maxValue: win.hub && win.hub.sys ? win.hub.sys.total : 1
             threshold: win.hub ? win.hub.setting("alertThreshold", 85) / 100 : 0
             colors: win.hub ? [win.hub.cSessions, win.hub.cApps, win.hub.cFiles, win.hub.cKernel, win.faint] : []
@@ -453,8 +474,8 @@ PanelWindow {
                 var tot = p.reduce(function(a, b) { return a + b }, 0)
                 var body = "sessions " + h.go(p[0]) + h.t(" · applis ", " · apps ") + h.go(p[1]) + " · /tmp " + h.go(p[2])
                   + h.t(" · noyau ", " · kernel ") + h.go(p[3]) + h.t(" · écart ", " · gap ") + h.go(p[4])
-                var span = h.range === "24h" ? 600 : h.range === "1h" ? 60 : 3
-                var evs = h.events.filter(function(e) { return t && Math.abs(e.t - t) <= span })
+                var colSec = times.length > 1 ? (times[times.length - 1] - times[0]) / (times.length - 1) : 2, span = Math.max(3, colSec * Math.ceil(g.markGap / g.step))
+                var evs = h.rangeEvents().filter(function(e) { return t && Math.abs(e.t - t) <= span }).reverse()
                 if (evs.length) body += "\n" + evs.map(function(e) { return h.hhmm(e.t) + "  " + e.text }).join("\n")
                 win.queueTip((t ? h.hhmm(t) + " · " : "") + h.go(tot) + h.t(" utilisés", " used"), body, g)
               }
@@ -493,15 +514,54 @@ PanelWindow {
             }
           }
         }
-        // derniers événements de la plage, avec le symbole de leur repère
+        // journal repliable des événements de la plage ; survoler une ligne marque l'instant sur les courbes
+        Item {
+          readonly property var evs: win.hub ? win.hub.rangeEvents() : []
+          width: parent.width; height: Math.round(win.rowH * 0.95)
+          visible: evs.length > 0
+          RqText {
+            id: journalHead
+            height: parent.height
+            text: (win.hub && win.hub.journalOpen ? "▾ " : "▸ ") + parent.evs.length + " "
+              + (parent.evs.length > 1 ? win.tx("événements", "events") : win.tx("événement", "event")) + " "
+              + (win.hub ? ({ live: win.tx("ces 5 min", "in 5 min"), "1h": win.tx("dans l'heure", "in the last hour"), "24h": win.tx("sur 24 h", "in 24 h") })[win.hub.range] : "")
+            color: Commons.Color.accent; font.pixelSize: win.cap
+            width: Math.min(implicitWidth, parent.width - allLog.width - Style.space(12))
+            MouseArea { anchors.fill: parent; cursorShape: Qt.PointingHandCursor; onClicked: win.hub.journalOpen = !win.hub.journalOpen }
+          }
+          RqText {
+            id: allLog
+            anchors.right: parent.right
+            height: parent.height
+            text: win.tx("tout le journal ↗", "full log ↗")
+            color: allMa.containsMouse ? Commons.Color.accent : win.dim; font.pixelSize: win.cap
+            font.underline: allMa.containsMouse
+            MouseArea { id: allMa; anchors.fill: parent; hoverEnabled: true; cursorShape: Qt.PointingHandCursor; onClicked: win.hub.openEvents() }
+          }
+        }
         Repeater {
-          model: win.hub ? win.hub.rangeEvents().slice(0, 3) : []
-          Row {
-            spacing: Style.space(6)
-            height: Math.round(win.rowH * 0.85)
-            RqText { height: parent.height; text: win.glyphOf(modelData.kind); color: win.hub.eventColor(modelData.kind); font.pixelSize: win.cap; font.bold: true }
-            RqText { height: parent.height; text: win.hub.hhmm(modelData.t); color: win.dim; font.pixelSize: win.cap }
-            RqText { height: parent.height; text: modelData.text; font.pixelSize: win.cap; width: memGraph.width - Style.space(40) }
+          model: win.hub && win.hub.journalOpen ? win.hub.rangeEvents().slice(0, 6) : []
+          Rectangle {
+            width: memGraph.width; height: Math.round(win.rowH * 0.85)
+            radius: Style.space(4)
+            color: rowMa.containsMouse ? Qt.rgba(Commons.Color.accent.r, Commons.Color.accent.g, Commons.Color.accent.b, 0.10) : "transparent"
+            Row {
+              x: Style.space(4)
+              height: parent.height
+              spacing: Style.space(6)
+              RqText { height: parent.height; text: win.hub.hhmm(modelData.t); color: win.dim; font.pixelSize: win.cap }
+              RqText { height: parent.height; text: win.glyphOf(modelData.kind); color: win.hub.eventColor(modelData.kind); font.pixelSize: win.cap; font.bold: true }
+              RqText { height: parent.height; text: modelData.text; font.pixelSize: win.cap; width: memGraph.width - Style.space(80) }
+            }
+            MouseArea {
+              id: rowMa
+              anchors.fill: parent
+              hoverEnabled: true
+              cursorShape: Qt.PointingHandCursor
+              onEntered: win.hub.hoverEventT = modelData.t
+              onExited: if (win.hub.hoverEventT === modelData.t) win.hub.hoverEventT = 0
+              onClicked: win.hub.openEvents(modelData.t)
+            }
           }
         }
         RqText {
@@ -524,16 +584,17 @@ PanelWindow {
           aside: win.hub && win.hub.sys ? "↓ " + win.hub.rate(win.hub.sys.net.rx) : ""
           asideColor: win.hub ? win.hub.cNet : win.dim
           RqChartFrame {
-            hub: win.hub
+            hub: win.hub; notchH: win.notchH
             yTop: win.hub ? win.hub.go(Math.max.apply(null, (win.hub.series("rx", 200).concat(win.hub.series("tx", 200), [1])))) : ""
             yMid: ""; yBottom: "0"
             plotHeight: Style.space(80)
             RqGraph {
-              width: parent.width; height: parent.height
+              width: parent.width; y: -notch; height: parent.height + notch; notch: win.notchH
               values: win.hub ? win.hub.series("rx", cols) : []
               values2: win.hub ? win.hub.series("tx", cols) : []
             MouseArea { anchors.fill: parent; hoverEnabled: true; onExited: win.leaveTip(parent); onPositionChanged: function(mouse) { win.graphTip(parent, mouse.x, "rx") } }
               marks: win.marksFor(win.hub ? win.hub.seriesTimes("rx", cols) : [])
+              cursor: win.cursorFor(win.hub ? win.hub.seriesTimes("rx", cols) : [])
               tint: win.hub ? win.hub.cNet : "white"
               tint2: Commons.Color.accent
             }
@@ -550,16 +611,17 @@ PanelWindow {
           aside: win.hub && win.hub.sys ? win.tx("écrit ", "write ") + win.hub.rate(win.hub.sys.disk.write) : ""
           asideColor: win.hub ? win.hub.cGpu : win.dim
           RqChartFrame {
-            hub: win.hub
+            hub: win.hub; notchH: win.notchH
             yTop: win.hub ? win.hub.go(Math.max.apply(null, (win.hub.series("rd", 200).concat(win.hub.series("wr", 200), [1])))) : ""
             yMid: ""; yBottom: "0"
             plotHeight: Style.space(80)
             RqGraph {
-              width: parent.width; height: parent.height
+              width: parent.width; y: -notch; height: parent.height + notch; notch: win.notchH
               values: win.hub ? win.hub.series("rd", cols) : []
               values2: win.hub ? win.hub.series("wr", cols) : []
             MouseArea { anchors.fill: parent; hoverEnabled: true; onExited: win.leaveTip(parent); onPositionChanged: function(mouse) { win.graphTip(parent, mouse.x, "rd") } }
               marks: win.marksFor(win.hub ? win.hub.seriesTimes("rd", cols) : [])
+              cursor: win.cursorFor(win.hub ? win.hub.seriesTimes("rd", cols) : [])
               tint: win.hub ? win.hub.cFiles : "white"
               tint2: win.hub ? win.hub.cGpu : "white"
             }
@@ -584,13 +646,14 @@ PanelWindow {
         aside: win.hub && win.hub.sys ? win.hub.sys.gpu.busy + " %" + (win.hub.sys.gpu.temp ? " · " + Math.round(win.hub.sys.gpu.temp) + "°" : "")
           + " · VRAM " + go(win.hub.sys.gpu.vram_used) : ""
         RqChartFrame {
-          hub: win.hub; yTop: "100"; yMid: ""; yBottom: "0"
+          hub: win.hub; notchH: win.notchH; yTop: "100"; yMid: ""; yBottom: "0"
           plotHeight: Style.space(76)
           RqGraph {
-            width: parent.width; height: parent.height
+            width: parent.width; y: -notch; height: parent.height + notch; notch: win.notchH
             values: win.hub ? win.hub.series("gpu", cols) : []
             MouseArea { anchors.fill: parent; hoverEnabled: true; onExited: win.leaveTip(parent); onPositionChanged: function(mouse) { win.graphTip(parent, mouse.x, "gpu") } }
             marks: win.marksFor(win.hub ? win.hub.seriesTimes("gpu", cols) : [])
+            cursor: win.cursorFor(win.hub ? win.hub.seriesTimes("gpu", cols) : [])
             maxValue: 100
             tint: win.hub ? win.hub.cGpu : "white"
           }

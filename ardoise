@@ -1446,6 +1446,8 @@ class Watcher:
         # ouvertures et fermetures : un groupe ne compte qu'une fois vu sur deux bilans de suite,
         # et n'est déclaré fermé qu'absent de deux bilans (les processus éclairs ne font pas de bruit)
         cur = {g["id"]: (g["name"], g["ram"] + g["zram"], g["kind"]) for g in b["groups"]}
+        gmap = {g["id"]: g for g in b["groups"]}
+        used = b["used"]
         notable = lambda kind, mem: kind == "claude" or mem > 150 * 1024 ** 2
         if self.known is None:
             self.known = dict(cur)
@@ -1455,7 +1457,8 @@ class Watcher:
                 if gid not in self.known and self.prev_groups and gid in self.prev_groups:
                     self.known[gid] = cur[gid]
                     if notable(kind, mem):
-                        out.append(self.event(now, "open", T(f"session {name} ouverte", f"session {name} opened") if kind == "claude" else T(f"{name} lancé ({_gb(mem)})", f"{name} started ({_gb(mem)})")))
+                        out.append(self.event(now, "open", T(f"session {name} ouverte", f"session {name} opened") if kind == "claude" else T(f"{name} lancé ({_gb(mem)})", f"{name} started ({_gb(mem)})"),
+                                              name=name, group=kind, delta=round(mem), used=round(used)))
                 elif gid in self.known:
                     self.known[gid] = cur[gid]
             for gid in list(self.known):
@@ -1466,7 +1469,8 @@ class Watcher:
                     name, mem, kind = self.known.pop(gid)
                     self.missing.pop(gid, None)
                     if notable(kind, mem):
-                        out.append(self.event(now, "close", T(f"session {name} fermée", f"session {name} closed") if kind == "claude" else T(f"{name} fermé ({_gb(mem)} rendus)", f"{name} closed ({_gb(mem)} freed)")))
+                        out.append(self.event(now, "close", T(f"session {name} fermée", f"session {name} closed") if kind == "claude" else T(f"{name} fermé ({_gb(mem)} rendus)", f"{name} closed ({_gb(mem)} freed)"),
+                                              name=name, group=kind, delta=-round(mem), used=round(used)))
         self.prev_groups = cur
 
         # fuites : une mémoire qui monte sans arrêt depuis au moins 25 minutes
@@ -1499,7 +1503,11 @@ class Watcher:
                 if now - self.leak_notified.get(gid, 0) > 7200:
                     self.leak_notified[gid] = now
                     name = cur[gid][0]
-                    out.append(self.event(now, "leak", T(f"fuite probable : {name} (+{_gb(slope)}/h)", f"probable leak: {name} (+{_gb(slope)}/h)")))
+                    g = gmap.get(gid, {})
+                    out.append(self.event(now, "leak", T(f"fuite probable : {name} (+{_gb(slope)}/h)", f"probable leak: {name} (+{_gb(slope)}/h)"),
+                                          name=name, group=cur[gid][2], slope=round(slope), mem=round(cur[gid][1]), used=round(used),
+                                          delta=round(ys[-1] - ys[0]), pids=list(g.get("roots", []))[:8],
+                                          series=[[round(t), round(m)] for t, m in ser]))
                     self.notify(T(f"Ardoise : {name} grossit sans arrêt", f"Ardoise: {name} keeps growing"),
                                 T(f"+{_gb(slope)} par heure depuis 30 min, il pèse {_gb(cur[gid][1])}. Une fuite de mémoire ?",
                                   f"+{_gb(slope)} per hour for 30 min, now {_gb(cur[gid][1])}. A memory leak?"),
@@ -1515,8 +1523,9 @@ class Watcher:
         if self.over >= 2 and (self.alert_armed or now - self.alerted_at > 1800 and pct >= self.threshold + 5):
             self.alert_armed = False
             self.alerted_at = now
-            out.append(self.event(now, "alert", T(f"alerte : RAM à {pct:.0f} %", f"alert: RAM at {pct:.0f}%")))
-            self.notify(T(f"RAM à {pct:.0f} % : voici qui la prend", f"RAM at {pct:.0f}%: here is who is using it"), self.culprits(b), urgency="critical", actions=True)
+            why = self.culprits(b)
+            out.append(self.event(now, "alert", T(f"alerte : RAM à {pct:.0f} %", f"alert: RAM at {pct:.0f}%"), pct=round(pct), used=round(b["used"]), detail=why))
+            self.notify(T(f"RAM à {pct:.0f} % : voici qui la prend", f"RAM at {pct:.0f}%: here is who is using it"), why, urgency="critical", actions=True)
         return out
 
     def culprits(self, b):
@@ -1536,8 +1545,10 @@ class Watcher:
         items.sort(key=lambda x: -x[0])
         return "\n".join("• " + t for _, t in items[:4])
 
-    def event(self, now, kind, text):
-        rec = dict(k="event", t=round(now), kind=kind, text=text)
+    def event(self, now, kind, text, **extra):
+        """Un événement : texte lisible, plus des champs pour la fenêtre des événements
+        (name, group, delta en octets, used = RAM utilisée alors, slope/series pour une fuite…)."""
+        rec = dict(k="event", t=round(now), kind=kind, text=text, **extra)
         self.write(rec)
         return dict(type="event", event=rec)
 
@@ -1580,7 +1591,7 @@ def flux():
         sys.stdout.write(json.dumps(o, ensure_ascii=False, separators=(",", ":")) + "\n")
 
     emit(dict(type="hw", hw=hardware()))
-    emit(w.backlog())
+    emit(w.backlog(KEEP_HOURS))
     sys.stdout.flush()
     last_full = 0
     last_lead_try = time.time()

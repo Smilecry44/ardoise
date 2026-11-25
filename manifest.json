@@ -2,7 +2,7 @@
   "schemaVersion": 1,
   "id": "io.github.smilecry44.ardoise",
   "name": "Ardoise",
-  "version": "0.3.1",
+  "version": "0.4.0",
   "author": "Quentin",
   "license": "MIT",
   "description": "Who is using your machine, in rows that add up to the total: Claude Code sessions with their MCP servers and scratchpads, memory owned by no process (/tmp, zram, kernel), apps and clones. CPU, network, disk and GPU charts. Follows the system language (English, French).",

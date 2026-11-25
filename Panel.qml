@@ -122,7 +122,24 @@ Panel {
   property var minutes: []  // { t, cpu, used, total, rx, tx, rd, wr, gpu, parts }
   property var events: []   // { t, kind, text }
   property string range: "live"   // live (5 min) | 1h | 24h
-  readonly property var rangeSpan: ({ live: 300, "1h": 3600, "24h": 86400 })
+  readonly property var rangeSpan: ({ live: 300, "1h": 3600, "24h": 86400, "48h": 172800 })
+  // ── événements : encoches, journal repliable, fenêtre du journal ──
+  property real hoverEventT: 0          // instant survolé dans le journal (trait fin sur les courbes)
+  property bool journalOpen: false
+  property bool eventsOpen: false
+  property real eventsFocusT: 0         // événement à choisir à l'ouverture de la fenêtre du journal
+  function openEvents(t) { eventsFocusT = t || 0; eventsOpen = true }
+  function closeEvents() { eventsOpen = false; hoverEventT = 0 }
+  // « voir sur la courbe » depuis le journal : la fenêtre centrée sur la bonne plage, l'instant marqué quelques secondes
+  function showMoment(t) {
+    var age = Date.now() / 1000 - t
+    range = age < 280 ? "live" : age < 3500 ? "1h" : "24h"
+    eventsOpen = false
+    if (!windowOpen) openWindow()
+    hoverEventT = t
+    momentTimer.restart()
+  }
+  Timer { id: momentTimer; interval: 8000; onTriggered: root.hoverEventT = 0 }
 
   // Valeurs d'une série pour la plage choisie, sur `cols` colonnes.
   // En direct : un point par relevé de 2 s. En 1 h / 24 h : l'axe suit le temps, chaque
@@ -141,9 +158,9 @@ Panel {
     if (range === "live") return key === "parts" ? hBreakT : hT
     return buckets(key, cols).times
   }
-  function buckets(key, cols) {
+  function buckets(key, cols, spanOverride) {
     var n = Math.max(1, Math.floor(cols || 200))  // les graphiques peuvent passer une largeur non entière
-    var now = Date.now() / 1000, span = rangeSpan[range], from = now - span, w = span / n
+    var now = Date.now() / 1000, span = spanOverride || rangeSpan[range], from = now - span, w = span / n
     var isParts = key === "parts", peak = key === "rx" || key === "tx" || key === "rd" || key === "wr"
     var empty = isParts ? [0, 0, 0, 0, 0] : 0
     var sums = [], counts = [], vals = [], times = []
@@ -155,12 +172,12 @@ Panel {
       if (m.t < from) { lastBefore = m; continue }
       var col = Math.max(0, Math.min(n - 1, Math.floor((m.t - from) / w)))
       if (isParts && !sums[col]) continue
-      var v = isParts ? (m.parts || [0, 0, 0, 0, 0]) : (m[key] || 0)
+      var v = isParts ? (m.parts || [0, 0, 0, 0, 0]) : key === "usedPct" ? (m.total ? 100 * m.used / m.total : 0) : (m[key] || 0)
       if (isParts) for (var k = 0; k < 5; k++) sums[col][k] += Number(v[k]) || 0
       else sums[col] = peak ? Math.max(sums[col], v) : sums[col] + v
       counts[col]++
     }
-    var prev = lastBefore ? { t: lastBefore.t, v: isParts ? (lastBefore.parts || empty) : (lastBefore[key] || 0) } : null
+    var prev = lastBefore ? { t: lastBefore.t, v: isParts ? (lastBefore.parts || empty) : key === "usedPct" ? (lastBefore.total ? 100 * lastBefore.used / lastBefore.total : 0) : (lastBefore[key] || 0) } : null
     for (var j = 0; j < n; j++) {
       if (counts[j]) {
         var val = isParts ? sums[j].map(function(x) { return x / counts[j] }) : (peak ? sums[j] : sums[j] / counts[j])
@@ -389,11 +406,11 @@ Panel {
     if (d.type === "hw") { hw = d.hw; return }
     if (d.type === "hist") { minutes = d.points; events = d.events; return }
     if (d.type === "minute") {
-      var m = minutes.length > 1500 ? minutes.slice(minutes.length - 1440) : minutes.slice()
+      var m = minutes.length > 3000 ? minutes.slice(minutes.length - 2880) : minutes.slice()
       m.push(d.point); minutes = m; return
     }
     if (d.type === "event") {
-      var ev = events.length > 400 ? events.slice(events.length - 300) : events.slice()
+      var ev = events.length > 3000 ? events.slice(events.length - 2500) : events.slice()
       ev.push(d.event); events = ev; return
     }
     if (d.type === "sys") {
@@ -488,6 +505,8 @@ Panel {
     function closeWindow(): void { root.closeWindow() }
     function toggleWindow(): void { root.toggleWindow() }
     function analyser(): void { root.analyser("") }
+    function journal(): void { root.openEvents(0) }
+    function closeJournal(): void { root.closeEvents() }
     function chercher(texte: string): void { root.openWindow(); root.search = texte }
     function vue(plage: string): void { root.range = plage === "5min" ? "live" : plage }
     function bulle(nom: string): void { root.openWindow(); root.bulleDemandee(nom) }
@@ -537,6 +556,16 @@ Panel {
   Loader {
     active: root.windowOpen
     source: Qt.resolvedUrl("Window.qml")
+    onLoaded: {
+      item.screenRef = button.QsWindow.window ? button.QsWindow.window.screen : null
+      item.hub = root
+    }
+  }
+
+  // ── fenêtre du journal des événements, au-dessus de la fenêtre centrée ──
+  Loader {
+    active: root.eventsOpen
+    source: Qt.resolvedUrl("EventsWindow.qml")
     onLoaded: {
       item.screenRef = button.QsWindow.window ? button.QsWindow.window.screen : null
       item.hub = root
