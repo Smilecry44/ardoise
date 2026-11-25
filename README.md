@@ -2,6 +2,12 @@
 
 An Omarchy bar widget that tells you **who** is using your machine, in rows that add up to the total.
 
+![Ardoise: the breakdown, the charts and every process grouped by app or session](preview.png)
+
+<sub>Screenshots taken with the French interface. Claude Code session names are pixelated.</sub>
+
+## Who uses the RAM
+
 Most monitors list processes one by one. Ardoise groups them by what you actually launched and charges each group everything it costs:
 
 - **Claude Code sessions** with their MCP servers, their shells, their scratchpad in `/tmp` and their share of zram — one bill per session.
@@ -9,15 +15,25 @@ Most monitors list processes one by one. Ardoise groups them by what you actuall
 - **Apps**, grouped by application, and **clones** (the same MCP server running once per session).
 - **The gap**: whatever the breakdown cannot explain, shown instead of hidden. The rows always add up to the RAM in use.
 
-It also draws CPU, memory, network, disk and GPU charts (5 min, 1 h, 24 h), and lists every process grouped by app or session, with actions on hover (pause, resume, lower priority, stop, kill).
+Every process is listed, grouped by app or session, with actions on hover (pause, resume, lower priority, stop, kill).
 
 To free memory, **Analyze with Claude** opens a Claude Code conversation that reads a full report of the machine (groups, idle sessions, orphan scratchpads, a ranked list of what could be closed) and proposes a plan sorted by gain and risk. It changes nothing without your approval.
 
-Events (a session or app opening or closing, a memory leak, a RAM alert) show as small notches above the charts and in a folding log under the memory chart; hovering a log line marks that moment on every chart. Events too close to read apart merge into one notch: the most important one (alert, then leak, closing, opening) followed by how many there are. **log ↗** opens a window with every event over 1 h, 24 h or 48 h: the memory curve with a notch per event, filters, and the details of each one (effect on memory, RAM in use at that moment, the curve of a leak).
+## History
+
+CPU, memory (split by owner), network, disk and GPU over 5 min, 1 h or 24 h, kept on disk for 48 h.
+
+![The 24 h view, with event notches above each chart](screenshots/24h.png)
+
+## Events
+
+A session or app opening or closing, a memory leak, a RAM alert: each one is a small notch above the charts. Notches too close to read apart merge into the most important one (alert, then leak, closing, opening) followed by how many there are. A folding log sits under the memory chart; hovering a line marks that moment on every chart.
+
+**log ↗** opens the events window: 1 h, 24 h or 48 h, a strip of memory, CPU, network, disk or GPU with a notch per event, filters by kind, a list by day, and the details of each event (effect on memory, RAM in use at that moment, the curve of a leak).
+
+![The events window](screenshots/events.png)
 
 The interface follows the system language: French or English.
-
-![Ardoise](preview.png)
 
 ## Install
 
