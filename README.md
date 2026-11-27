@@ -29,9 +29,19 @@ CPU, memory (split by owner), network, disk and GPU over 5 min, 1 h or 24 h, kep
 
 A session or app opening or closing, a memory leak, a RAM alert: each one is a small notch above the charts. Notches too close to read apart merge into the most important one (alert, then leak, closing, opening) followed by how many there are. A folding log sits under the memory chart; hovering a line marks that moment on every chart.
 
-**log ↗** opens the events window: 1 h, 24 h or 48 h, a strip of memory, CPU, network, disk or GPU with a notch per event, filters by kind, a list by day, and the details of each event (effect on memory, RAM in use at that moment, the curve of a leak).
+**tools ▾ → log ↗** opens the events window: 1 h, 24 h or 48 h, a strip of memory, CPU, network, disk or GPU with a notch per event, filters by kind, a list by day, and the details of each event (effect on memory, RAM in use at that moment, the curve of a leak).
 
 ![The events window](screenshots/events.png)
+
+## Machine card
+
+**tools ▾ → machine ↗** shows the machine at a glance: motherboard and BIOS, processor, graphics, memory, swap, disks (with encryption), displays and network; the system, kernel, desktop, theme, terminal and packages; how long it has been up, when it was installed, the load and the local IP.
+
+**copy the card** puts it on the clipboard as Markdown, ready to paste on Reddit, Discord or GitHub when asking for help. No serial numbers, no user name, and the local IP stays out unless you switch it on. Clicking a line copies that line alone.
+
+![The machine card](screenshots/machine.png)
+
+The details come from [fastfetch](https://github.com/fastfetch-cli/fastfetch), shipped with Omarchy. Without it, the card shows what Ardoise reads itself from `/proc` and `/sys`.
 
 The interface follows the system language: French or English.
 
@@ -50,6 +60,7 @@ Optional, to use `ardoise` in a terminal:
 ln -sf ~/.config/omarchy/plugins/io.github.smilecry44.ardoise/ardoise ~/.local/bin/ardoise
 ardoise            # readable breakdown
 ardoise --json     # the same, as JSON
+ardoise machine    # the machine card, as Markdown (--ip adds the local IP, --json for the raw data)
 ```
 
 ## Remove
@@ -66,6 +77,7 @@ omarchy restart shell
 - Omarchy with the Quickshell bar, Linux `/proc`, `python3` (standard library only).
 - Optional: [Claude Code](https://claude.com/claude-code) — sessions are detected from `~/.claude/sessions`, and "Analyze with Claude" opens a conversation that reads a full report and suggests what to free. Without Claude Code these parts are hidden.
 - Optional: Herdr — session rows show their Herdr space, and clicking a session brings its conversation forward. Without Herdr, the analysis opens in a terminal.
+- Optional: `fastfetch` (installed with Omarchy) for the full machine card, and `wl-copy` to copy it.
 - GPU chart: GPUs that expose `gpu_busy_percent` in sysfs (AMD). Other GPUs: the chart stays empty.
 
 ## Settings

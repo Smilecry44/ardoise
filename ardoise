@@ -684,6 +684,318 @@ def hardware():
     return hw
 
 
+# ---------- fiche machine ----------
+
+MOIS = ("janvier", "février", "mars", "avril", "mai", "juin", "juillet", "août",
+        "septembre", "octobre", "novembre", "décembre")
+MONTHS = ("January", "February", "March", "April", "May", "June", "July", "August",
+          "September", "October", "November", "December")
+
+
+def _fastfetch():
+    """Ce que fastfetch sait (écrans, disques, système…), par type. Vide sans fastfetch."""
+    import subprocess
+    if not shutil.which("fastfetch"):
+        return {}
+    mods = "host:board:bios:cpu:gpu:display:disk:swap:os:kernel:wm:packages:localip"
+    try:
+        out = subprocess.run(["fastfetch", "--format", "json", "-s", mods], capture_output=True, text=True, timeout=8).stdout
+        return {x["type"]: x.get("result") for x in json.loads(out) if x.get("result") is not None}
+    except (OSError, subprocess.SubprocessError, ValueError, KeyError, TypeError):
+        return {}
+
+
+def _num(v, d=1):
+    s = f"{v:.{d}f}"
+    return s.replace(".", ",") if FR else s
+
+
+def _int_sp(n):
+    """1467 → « 1 467 » en français, « 1,467 » en anglais."""
+    s = f"{int(n):,}"
+    return s.replace(",", "\u00a0") if FR else s
+
+
+def _gb_dec(n):
+    """Taille d'un disque en Go décimaux, comme le constructeur l'annonce."""
+    g = n / 1e9
+    return f"{_int_sp(round(g))}" if g >= 10 else _num(g)
+
+
+def _encrypted(dev):
+    """Le périphérique passe-t-il par LUKS ?"""
+    name = os.path.basename(os.path.realpath(dev)) if dev.startswith("/dev/") else ""
+    for _ in range(6):
+        if not name:
+            return False
+        if (read(f"/sys/class/block/{name}/dm/uuid") or "").startswith("CRYPT-"):
+            return True
+        slaves = glob.glob(f"/sys/class/block/{name}/slaves/*")
+        name = os.path.basename(slaves[0]) if slaves else None
+    return False
+
+
+def _transport(disk):
+    if not disk:
+        return ""
+    if disk.startswith("nvme"):
+        return "NVMe"
+    if (read(f"/sys/block/{disk}/queue/rotational") or "").strip() == "1":
+        return T("disque dur", "hard drive")
+    return "SSD" if disk.startswith("sd") else ""
+
+
+def _installed_on():
+    """Date d'installation : la première ligne du journal de pacman, sinon la naissance de /."""
+    m = re.match(r"\[(\d{4})-(\d{2})-(\d{2})", read("/var/log/pacman.log") or "")
+    if m:
+        return time.mktime((int(m[1]), int(m[2]), int(m[3]), 0, 0, 0, 0, 0, -1))
+    import subprocess
+    try:
+        w = int(subprocess.run(["stat", "-c", "%W", "/"], capture_output=True, text=True, timeout=3).stdout.strip())
+        return w or None
+    except (OSError, ValueError, subprocess.SubprocessError):
+        return None
+
+
+def _terminal():
+    """Le terminal par défaut d'Omarchy (xdg-terminal-exec), par son nom lisible."""
+    for line in (read(os.path.join(HOME, ".config", "xdg-terminals.list")) or "").splitlines():
+        line = line.strip()
+        if not line or line.startswith("#"):
+            continue
+        for d in (os.path.join(HOME, ".local/share/applications"), "/usr/share/applications"):
+            m = re.search(r"^Name=(.+)$", read(os.path.join(d, line)) or "", re.M)
+            if m:
+                return m.group(1).strip()
+        return line.rsplit(".", 2)[-2] if line.endswith(".desktop") else line
+    return ""
+
+
+def _shell():
+    import subprocess
+    sh = os.environ.get("SHELL") or ""
+    name = os.path.basename(sh)
+    if not name:
+        return ""
+    try:
+        out = subprocess.run([sh, "--version"], capture_output=True, text=True, timeout=3).stdout
+        m = re.search(r"(\d+\.\d+(?:\.\d+)?)", out)
+        return f"{name} {m.group(1)}" if m else name
+    except (OSError, subprocess.SubprocessError):
+        return name
+
+
+def _ago(days):
+    if days < 1:
+        return T("aujourd'hui", "today")
+    if days < 2:
+        return T("hier", "yesterday")
+    if days < 60:
+        return T(f"il y a {days} jours", f"{days} days ago")
+    months = round(days / 30.4)
+    if months < 24:
+        return T(f"il y a {months} mois", f"{months} months ago")
+    return T(f"il y a {days // 365} ans", f"{days // 365} years ago")
+
+
+def machine():
+    """La fiche de la machine : matériel, logiciel, état. Chaque ligne est déjà écrite
+    dans la langue choisie ; `text` est la même fiche en Markdown, à coller sur un forum
+    (sans numéro de série ni nom d'utilisateur ; `text_ip` y ajoute l'IP locale)."""
+    ff = _fastfetch()
+    hw = hardware()
+    sections = []
+
+    def row(label, value, detail="", **kw):
+        return dict(label=label, value=value, detail=detail, **kw)
+
+    # ── matériel ──
+    rows = []
+    board = ff.get("Board") or ff.get("Host") or {}
+    if board.get("name"):
+        vendor = _short_vendor(board.get("vendor")) or (board.get("vendor") or "").split()[0]
+        if vendor.lower().startswith("gigabyte"):
+            vendor = "Gigabyte"
+        bios = ff.get("BIOS") or {}
+        bd = ""
+        m = re.match(r"(\d{2})/(\d{2})/(\d{4})", bios.get("date") or "")
+        if m:
+            bd = (MOIS if FR else MONTHS)[int(m[1]) - 1] + " " + m[3]
+        detail = " · ".join(x for x in ("BIOS " + bios["version"] if bios.get("version") else "", bd, bios.get("type") or "") if x)
+        rows.append(row(T("carte mère", "motherboard"), f"{vendor} {board['name']}".strip(), detail))
+
+    cpu = ff.get("CPU") or {}
+    cpu_name = cpu.get("cpu") or (hw.get("cpu") or "").split(" · ")[0]
+    if cpu_name:
+        cores = (cpu.get("cores") or {})
+        bits = []
+        if cores.get("physical"):
+            bits.append(T(f"{cores['physical']} cœurs, {cores.get('logical') or NCPU} fils", f"{cores['physical']} cores, {cores.get('logical') or NCPU} threads"))
+        elif hw.get("cpu"):
+            bits.append(hw["cpu"].split(" · ", 1)[-1])
+        fmax = (cpu.get("frequency") or {}).get("max")
+        if fmax:
+            bits.append(T(f"{_num(fmax / 1000, 2)} GHz max", f"{_num(fmax / 1000, 2)} GHz max"))
+        t = cpu_temp()
+        if t:
+            bits.append(f"{t:.0f}°")
+        rows.append(row(T("processeur", "processor"), cpu_name, " · ".join(bits)))
+
+    g = gpu()
+    gpus = [x for x in (ff.get("GPU") or []) if x.get("name")]
+    if hw.get("gpu") or gpus:
+        name = hw["gpu"].split(" · ")[0] if hw.get("gpu") else f"{gpus[0].get('vendor') or ''} {gpus[0]['name']}".strip()
+        bits = []
+        if g["vram_total"]:
+            bits.append(f"{g['vram_total'] / GO:.0f} {GO_U} VRAM")
+        if gpus and gpus[0].get("driver"):
+            bits.append(gpus[0]["driver"])
+        if g["temp"]:
+            bits.append(f"{g['temp']:.0f}°")
+        rows.append(row(T("graphique", "graphics"), name, " · ".join(bits)))
+        for other in gpus[1:]:
+            rows.append(row("", f"{other.get('vendor') or ''} {other['name']}".strip(), T("intégrée", "integrated") if other.get("type") == "Integrated" else ""))
+
+    mi = meminfo()
+    used = mi["MemTotal"] - mi["MemAvailable"]
+    rows.append(row(T("mémoire", "memory"), hw.get("mem") or f"{mi['MemTotal'] / GO:.0f} {GO_U}", "",
+                    bar=used / mi["MemTotal"], kind="mem",
+                    amount=f"{_num(used / GO)} / {_num(mi['MemTotal'] / GO)} {GO_U}", pct=f"{100 * used / mi['MemTotal']:.0f} %"))
+    swaps = []
+    for s in ff.get("Swap") or []:
+        n = s.get("name") or ""
+        nm = "zram" if "zram" in n else "partition" if n.startswith("/dev/") else T("fichier", "file")
+        swaps.append(f"{nm} {_num((s.get('used') or 0) / GO)} / {_num((s.get('total') or 0) / GO)} {GO_U}")
+    if swaps:
+        rows.append(row("swap", "", " · ".join(swaps)))
+    sections.append(dict(key="hw", title=T("matériel", "hardware"), rows=rows))
+
+    # ── disques, écrans, réseau (dans le bloc matériel, après un trait) ──
+    rows = []
+    seen, first = set(), True
+    for d in ff.get("Disk") or []:
+        src = d.get("mountFrom") or ""
+        if "Subvolume" in (d.get("volumeType") or []) or src in seen:
+            continue
+        seen.add(src)
+        total = (d.get("bytes") or {}).get("total") or 0
+        free = (d.get("bytes") or {}).get("free") or 0
+        if not total:
+            continue
+        mp = d.get("mountpoint") or ""
+        mp_short = "~" + mp[len(HOME):] if mp.startswith(HOME + "/") else mp
+        fs = d.get("filesystem") or ""
+        disk = _disk_of(mp) if src.startswith("/dev/") else None
+        model = (read(f"/sys/block/{disk}/device/model") or "").strip() if disk else ""
+        enc = T(" chiffré", " encrypted") if src.startswith("/dev/") and _encrypted(src) else ""
+        detail = " · ".join(x for x in (mp_short, fs + enc, _transport(disk)) if x)
+        rows.append(row(T("disques", "disks") if first else "", model or src.split(":")[0] or mp_short, detail,
+                        bar=(total - free) / total, kind="disk",
+                        amount=f"{_gb_dec(total - free)} / {_gb_dec(total)} {GO_U}", pct=f"{100 * (total - free) / total:.0f} %"))
+        first = False
+    first = True
+    for s in sorted(ff.get("Display") or [], key=lambda s: not (s.get("name") or "").strip("\x00 ")):
+        o = s.get("output") or {}
+        if not o.get("width"):
+            continue
+        name = (s.get("name") or "").strip("\x00 ") or T("sans nom", "unnamed")
+        ph = s.get("physical") or {}
+        inch = f"{(ph['width'] ** 2 + ph['height'] ** 2) ** 0.5 / 25.4:.0f}\"" if ph.get("width") and ph.get("height") else ""
+        hz = f"{o['refreshRate']:.0f} Hz" if o.get("refreshRate") else ""
+        rows.append(row(T("écrans", "displays") if first else "", name, "", res=f"{o['width']}×{o['height']}", hz=hz, inch=inch))
+        first = False
+    if hw.get("net"):
+        chip, _, rest = hw["net"].partition(" · ")
+        rows.append(row(T("réseau", "network"), chip.strip(), rest))
+    sections.append(dict(key="hw2", title="", rows=rows))
+
+    # ── logiciel ──
+    rows = []
+    osr = ff.get("OS") or {}
+    if not osr:  # sans fastfetch : /etc/os-release
+        kv = dict(re.findall(r'^(\w+)="?([^"\n]*)"?$', read("/etc/os-release") or "", re.M))
+        osr = dict(prettyName=kv.get("PRETTY_NAME") or kv.get("NAME"), versionID=kv.get("BUILD_ID") or kv.get("VERSION_ID"), idLike=kv.get("ID_LIKE"))
+    os_name = osr.get("prettyName") or osr.get("name") or "Linux"
+    rows.append(row(T("système", "system"), f"{os_name} {osr.get('versionID') or osr.get('buildID') or ''}".strip(),
+                    T("base ", "based on ") + osr["idLike"].capitalize() if osr.get("idLike") else ""))
+    k = ff.get("Kernel") or {}
+    rows.append(row(T("noyau", "kernel"), f"{k.get('name') or 'Linux'} {k.get('release') or os.uname().release}"))
+    wm = ff.get("WM") or {}
+    if wm.get("prettyName"):
+        rows.append(row(T("bureau", "desktop"), f"{wm['prettyName']} {wm.get('version') or ''}".strip(), wm.get("protocolName") or ""))
+    theme = (read(os.path.join(HOME, ".local/state/omarchy/current/theme.name")) or "").strip()
+    if theme:
+        rows.append(row(T("thème", "theme"), re.sub(r"(^|-)([a-z])", lambda m: m[1] + m[2].upper(), theme).replace("-", " ")))
+    term, sh = _terminal(), _shell()
+    if term or sh:
+        rows.append(row("terminal", term or sh, sh if term else ""))
+    p = ff.get("Packages") or {}
+    if p.get("all"):
+        kinds = ", ".join(f"{_int_sp(v)} {k_}" for k_, v in p.items() if k_ != "all" and isinstance(v, int) and v)
+        rows.append(row(T("paquets", "packages"), _int_sp(p["all"]), kinds if "," in kinds else kinds.split(" ", 1)[-1]))
+    sections.append(dict(key="sw", title=T("logiciel", "software"), rows=rows))
+
+    # ── état ──
+    rows = []
+    up = float((read("/proc/uptime") or "0").split()[0])
+    boot = time.time() - up
+    bt = time.localtime(boot)
+    today = time.strftime("%Y%m%d", bt) == time.strftime("%Y%m%d")
+    when = time.strftime(T("à %H:%M", "since %H:%M") if today else T("le %d/%m à %H:%M", "since %m/%d %H:%M"), bt)
+    rows.append(row(T("allumée", "up"), T("depuis ", "for ") + dur(up), when))
+    inst = _installed_on()
+    if inst:
+        rows.append(row(T("installée", "installed"), _ago(int((time.time() - inst) // 86400)), time.strftime(T("%d/%m/%Y", "%Y-%m-%d"), time.localtime(inst))))
+    la = os.getloadavg()
+    rows.append(row(T("charge", "load"), " · ".join(_num(x, 2) for x in la), T(f"sur {NCPU} fils", f"over {NCPU} threads")))
+    ip = next((x for x in ff.get("LocalIp") or [] if x.get("ipv4")), None)
+    if ip:
+        rows.append(row(T("IP locale", "local IP"), ip["ipv4"].split("/")[0], ip.get("name") or "", private=True))
+    sections.append(dict(key="state", title=T("état", "status"), rows=rows))
+
+    for s in sections:  # blocs étroits : le détail suit la valeur sur la même ligne
+        if s["key"] in ("sw", "state"):
+            for r in s["rows"]:
+                r["inline"] = True
+
+    # ── en une ligne, pour le sous-titre ──
+    short = [cpu_name.replace("AMD ", "").replace("Intel(R) Core(TM) ", ""),
+             (hw.get("gpu") or "").split(" · ")[0].replace("AMD ", ""), hw.get("mem", "").split(" ")[0] + f" {GO_U}" if hw.get("mem") else ""]
+    disks_total = sum(((d.get("bytes") or {}).get("total") or 0) for d in ff.get("Disk") or [] if "Subvolume" not in (d.get("volumeType") or []))
+    if disks_total:
+        short.append(T(f"{_num(disks_total / 1e12, 0 if disks_total >= 2e12 else 1)} To de disques", f"{_num(disks_total / 1e12, 0 if disks_total >= 2e12 else 1)} TB of disks"))
+    nd = len([s for s in ff.get("Display") or [] if (s.get("output") or {}).get("width")])
+    if nd:
+        short.append(T(f"{nd} écran" + ("s" if nd > 1 else ""), f"{nd} display" + ("s" if nd > 1 else "")))
+
+    def text(with_ip):
+        out = ["```"]
+        for s in sections:
+            if s["title"]:
+                if len(out) > 1:
+                    out.append("")
+                out.append(s["title"].capitalize())
+            for r in s["rows"]:
+                if r.get("private") and not with_ip:
+                    continue
+                val = r["value"]
+                if r.get("res"):
+                    val = " · ".join(x for x in (val, r["res"], r.get("hz"), r.get("inch")) if x)
+                if r.get("amount"):
+                    val = f"{val} · {r['amount']} ({r['pct'].replace(' ', '')})" if val else r["amount"]
+                if r["detail"] and r.get("kind") != "mem":
+                    val = f"{val} · {r['detail']}" if val else r["detail"]
+                lab = r["label"][:1].upper() + r["label"][1:] if r["label"] else ""
+                out.append(f"  {lab:<12}{val}")
+        out += ["```", T("— fiche Ardoise", "— Ardoise machine card")]
+        return "\n".join(out)
+
+    return dict(subtitle=" · ".join(x for x in short if x.strip()), uptime=dur(up),
+                sections=sections, text=text(False), text_ip=text(True),
+                has_fastfetch=bool(ff))
+
+
 _spaces_cache = {"t": 0, "v": {}}
 
 
@@ -1673,6 +1985,13 @@ def main():
     if "--flux" in a:
         signal.signal(signal.SIGPIPE, signal.SIG_DFL)
         return flux()
+    if a[:1] == ["machine"]:
+        m = machine()
+        if "--json" in a:
+            print(json.dumps(m, ensure_ascii=False))
+        else:
+            print(m["text_ip"] if "--ip" in a else m["text"])
+        return
     if "--materiel" in a:
         print(json.dumps(hardware(), ensure_ascii=False, indent=1))
         return

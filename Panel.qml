@@ -130,6 +130,10 @@ Panel {
   property real eventsFocusT: 0         // événement à choisir à l'ouverture de la fenêtre du journal
   function openEvents(t) { eventsFocusT = t || 0; eventsOpen = true }
   function closeEvents() { eventsOpen = false; hoverEventT = 0 }
+  // ── fiche machine : matériel, logiciel, état, copie pour un forum ──
+  property bool machineOpen: false
+  function openMachine() { machineOpen = true }
+  function closeMachine() { machineOpen = false }
   // « voir sur la courbe » depuis le journal : la fenêtre centrée sur la bonne plage, l'instant marqué quelques secondes
   function showMoment(t) {
     var age = Date.now() / 1000 - t
@@ -507,6 +511,8 @@ Panel {
     function analyser(): void { root.analyser("") }
     function journal(): void { root.openEvents(0) }
     function closeJournal(): void { root.closeEvents() }
+    function machine(): void { root.openMachine() }
+    function closeMachine(): void { root.closeMachine() }
     function chercher(texte: string): void { root.openWindow(); root.search = texte }
     function vue(plage: string): void { root.range = plage === "5min" ? "live" : plage }
     function bulle(nom: string): void { root.openWindow(); root.bulleDemandee(nom) }
@@ -566,6 +572,16 @@ Panel {
   Loader {
     active: root.eventsOpen
     source: Qt.resolvedUrl("EventsWindow.qml")
+    onLoaded: {
+      item.screenRef = button.QsWindow.window ? button.QsWindow.window.screen : null
+      item.hub = root
+    }
+  }
+
+  // ── fiche machine, au-dessus de la fenêtre centrée ──
+  Loader {
+    active: root.machineOpen
+    source: Qt.resolvedUrl("MachineWindow.qml")
     onLoaded: {
       item.screenRef = button.QsWindow.window ? button.QsWindow.window.screen : null
       item.hub = root

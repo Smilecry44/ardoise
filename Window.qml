@@ -12,6 +12,7 @@ PanelWindow {
   id: win
   property var hub: null
   property var screenRef: null
+  property bool toolsOpen: false   // menu « outils » (journal, machine) déplié
 
   screen: screenRef
   visible: hub !== null
@@ -178,7 +179,7 @@ PanelWindow {
       id: keys
       anchors.fill: parent
       focus: true
-      Keys.onEscapePressed: { if (win.hub.search !== "") win.hub.search = ""; else win.hub.closeWindow() }
+      Keys.onEscapePressed: { if (win.toolsOpen) win.toolsOpen = false; else if (win.hub.search !== "") win.hub.search = ""; else win.hub.closeWindow() }
       Keys.onPressed: function(e) {
         if (e.text === "/" ) { search.forceActiveFocus(); e.accepted = true }
       }
@@ -322,10 +323,12 @@ PanelWindow {
       width: (card.width - Style.space(36)) * 0.36
       spacing: win.gap
 
-      // plage d'historique + légende des repères
+      // plage d'historique + légende des repères + menu outils
       Item {
         width: parent.width; height: win.rowH
+        z: 10   // le menu déplié passe au-dessus des boîtes suivantes
         Row {
+          id: rangeLine
           height: parent.height
           spacing: Style.space(10)
           RqText { height: parent.height; text: win.tx("historique", "history"); color: win.dim; font.pixelSize: win.cap }
@@ -357,23 +360,64 @@ PanelWindow {
             color: win.dim; font.pixelSize: win.cap
           }
         }
+        // à droite : la légende des repères (si elle tient), puis le menu « outils »
         Row {
-          anchors.right: parent.right
+          id: markersRow
+          anchors.right: toolsBtn.left; anchors.rightMargin: Style.space(10)
           height: parent.height
           spacing: Style.space(8)
+          visible: rangeLine.implicitWidth + implicitWidth + toolsBtn.width + Style.space(24) <= parent.width
           RqText { height: parent.height; text: win.tx("repères", "markers"); color: win.dim; font.pixelSize: win.cap }
           Repeater {
             model: win.hub ? [{ t: win.tx("▲ ouvert", "▲ opened"), k: "open" }, { t: win.tx("▼ fermé", "▼ closed"), k: "close" }, { t: win.tx("↗ fuite", "↗ leak"), k: "leak" }, { t: win.tx("! alerte", "! alert"), k: "alert" }] : []
             RqText { height: parent.height; text: modelData.t; color: win.hub.eventColor(modelData.k); font.pixelSize: win.cap }
           }
+        }
+        Rectangle {
+          id: toolsBtn
+          anchors.right: parent.right; anchors.verticalCenter: parent.verticalCenter
+          height: Style.space(18); radius: Style.space(5)
+          width: toolsLabel.implicitWidth + Style.space(14)
+          color: toolsMa.containsMouse || win.toolsOpen ? Qt.rgba(Commons.Color.accent.r, Commons.Color.accent.g, Commons.Color.accent.b, 0.15) : "transparent"
+          border.color: win.toolsOpen ? Commons.Color.accent : Qt.rgba(win.fg.r, win.fg.g, win.fg.b, 0.14)
+          RqText { id: toolsLabel; anchors.centerIn: parent; text: win.tx("outils ", "tools ") + (win.toolsOpen ? "▴" : "▾"); color: Commons.Color.accent; font.pixelSize: win.cap }
+          MouseArea { id: toolsMa; anchors.fill: parent; hoverEnabled: true; cursorShape: Qt.PointingHandCursor; onClicked: win.toolsOpen = !win.toolsOpen }
+
+          // le menu déplié, par-dessus les graphiques
           Rectangle {
-            anchors.verticalCenter: parent.verticalCenter
-            height: Style.space(18); radius: Style.space(5)
-            width: journalBtn.implicitWidth + Style.space(14)
-            color: journalMa.containsMouse ? Qt.rgba(Commons.Color.accent.r, Commons.Color.accent.g, Commons.Color.accent.b, 0.15) : "transparent"
-            border.color: Qt.rgba(win.fg.r, win.fg.g, win.fg.b, 0.14)
-            RqText { id: journalBtn; anchors.centerIn: parent; text: win.tx("journal ↗", "log ↗"); color: Commons.Color.accent; font.pixelSize: win.cap }
-            MouseArea { id: journalMa; anchors.fill: parent; hoverEnabled: true; cursorShape: Qt.PointingHandCursor; onClicked: win.hub.openEvents() }
+            visible: win.toolsOpen
+            anchors.top: parent.bottom; anchors.topMargin: Style.space(4)
+            anchors.right: parent.right
+            width: toolsCol.implicitWidth + Style.space(12)
+            height: toolsCol.implicitHeight + Style.space(12)
+            radius: Style.space(7)
+            color: Qt.rgba(Commons.Color.background.r, Commons.Color.background.g, Commons.Color.background.b, 0.99)
+            border.color: Qt.rgba(Commons.Color.accent.r, Commons.Color.accent.g, Commons.Color.accent.b, 0.6)
+            Column {
+              id: toolsCol
+              x: Style.space(6); y: Style.space(6)
+              Repeater {
+                model: [{ t: win.tx("journal ↗", "log ↗"), d: win.tx("événements sur 48 h", "events over 48 h"), k: "j" },
+                        { t: win.tx("machine ↗", "machine ↗"), d: win.tx("matériel, logiciel, copie", "hardware, software, copy"), k: "m" }]
+                Rectangle {
+                  width: Math.max(itemRow.implicitWidth + Style.space(16), Style.space(230))
+                  height: win.rowH + Style.space(4)
+                  radius: Style.space(4)
+                  color: itemMa.containsMouse ? Qt.rgba(Commons.Color.accent.r, Commons.Color.accent.g, Commons.Color.accent.b, 0.15) : "transparent"
+                  Row {
+                    id: itemRow
+                    x: Style.space(8); height: parent.height
+                    spacing: Style.space(12)
+                    RqText { height: parent.height; width: Style.space(84); text: modelData.t; color: Commons.Color.accent; font.pixelSize: win.cap }
+                    RqText { height: parent.height; text: modelData.d; color: win.dim; font.pixelSize: win.cap }
+                  }
+                  MouseArea {
+                    id: itemMa; anchors.fill: parent; hoverEnabled: true; cursorShape: Qt.PointingHandCursor
+                    onClicked: { win.toolsOpen = false; if (modelData.k === "j") win.hub.openEvents(); else win.hub.openMachine() }
+                  }
+                }
+              }
+            }
           }
         }
       }
